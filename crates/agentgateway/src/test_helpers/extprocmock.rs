@@ -94,8 +94,13 @@ pub trait Handler {
 		false
 	}
 
-	/// Called when the client ends its stream of requests cleanly, after the last request.
-	async fn on_eof(&mut self) {}
+	/// Called when the client's stream of requests ends without failing, after the last request.
+	///
+	/// A tonic server also reports a call the client cancelled (RST_STREAM with CANCEL) this way: its
+	/// request stream treats a cancelled body as the end of the stream. To tell the two apart, look at
+	/// `response_stream`: the server's connection drops the response stream of a cancelled call at
+	/// once, which `closed()` reports, and leaves that of a half-closed call open for the client to read.
+	async fn on_eof(&mut self, _response_stream: &mpsc::Sender<Result<ProcessingResponse, Status>>) {}
 
 	/// Called when the stream of requests fails instead of ending, which is what a server sees when the
 	/// client cancels the call (the HTTP/2 stream is reset).
@@ -292,7 +297,7 @@ where
 						return Ok::<(), Status>(());
 					}
 				}
-				handler.on_eof().await;
+				handler.on_eof(&tx).await;
 				Ok::<(), Status>(())
 			}
 			.await;

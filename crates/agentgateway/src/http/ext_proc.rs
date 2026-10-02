@@ -442,7 +442,7 @@ struct ProcessedResponse {
 
 impl Drop for ProcessedResponse {
 	fn drop(&mut self) {
-		if self.senders.upgrade().is_some() {
+		if self.senders.strong_count() > 0 {
 			self.abort.cancel();
 		}
 	}

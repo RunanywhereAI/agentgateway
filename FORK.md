@@ -22,14 +22,18 @@ dropped while the processing of it is still running (a sender of the body's chan
 call (`AbortableChannel` in `ext_proc/channel.rs`) fails with an `h2::Error` of reason CANCEL
 (`agent_hbone::cancelled()`), which hyper turns into RST_STREAM(CANCEL), and the task that reads the stream of
 responses stops and drops it. The server sees a cancelled call (for a Go gRPC server, the stream's context is
-cancelled and `Recv` returns an error, not `io.EOF`), where a half-close shows it a clean end. A response processed to
-its end still closes the call cleanly.
+cancelled and `Recv` returns an error, not `io.EOF`), where a half-close shows it a clean end. A tonic server
+reports a cancelled request body as a clean end of the request stream (its decoder maps a `Cancelled` body error to the
+end), so the tests tell the two apart by the server's response stream: the connection drops it at once for a cancelled
+call and leaves it open for the client to read after a half-close. A response processed to its end still closes the call
+cleanly.
 
 Files: `crates/agentgateway/src/http/ext_proc.rs` (the fix), `ext_proc/channel.rs` (the abortable channel),
 `crates/hbone/src/lib.rs` (`cancelled()`, which saves a dependency edit), `crates/agentgateway/src/http/ext_proc_tests.rs`
 (the tests `dropping_the_response_cancels_the_upstream_and_the_ext_proc_call` and
 `a_response_read_to_its_end_closes_the_ext_proc_stream_cleanly`) and
-`crates/agentgateway/src/test_helpers/extprocmock.rs` (`on_eof` and `on_stream_error` hooks on the mock handler).
+`crates/agentgateway/src/test_helpers/extprocmock.rs` (`on_eof`, which is given the response stream, and
+`on_stream_error` hooks on the mock handler).
 
 ### 2. A body field read never materialises a large or non-scalar value
 
