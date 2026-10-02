@@ -1,9 +1,12 @@
 # RunanywhereAI fork of agentgateway
 
-This branch, `ra/v1.5.0-client-leave`, is upstream tag `v1.5.0`
-(commit fe6732474a96a0363dfb9822859af4e9bab360fa) plus one change and its test. Nothing else differs.
+This branch, `ra/v1.5.0-ra.2`, is upstream tag `v1.5.0`
+(commit fe6732474a96a0363dfb9822859af4e9bab360fa) plus two changes and their tests. Nothing else differs.
+The earlier branch `ra/v1.5.0-client-leave` carries the first change only (the build `v1.5.0-ra.1`).
 
 ## What it carries
+
+### 1. Cancel the upstream when the client leaves
 
 When an ext_proc policy processes the response body in `FULL_DUPLEX_STREAMED` mode and the downstream
 client disconnects after the response headers were sent, upstream v1.5.0 keeps reading the upstream body
@@ -17,6 +20,20 @@ Files: `crates/agentgateway/src/http/ext_proc.rs` (the fix),
 `crates/agentgateway/src/http/ext_proc_tests.rs` (the test
 `dropping_the_response_cancels_the_upstream_and_ends_the_ext_proc_stream`) and
 `crates/agentgateway/src/test_helpers/extprocmock.rs` (an `on_eof` hook on the mock handler).
+
+### 2. A body field read never materialises a large or non-scalar value
+
+`jsonField` is what the expression optimizer makes of `json(x).f`. It streamed to the key and then built the
+whole value as a `serde_json::Value` and a CEL value, so a request of 8 MiB whose `model` is an array of tiny
+objects cost the proxy about 450 MiB, before any credential was checked. `jsonField` now accepts only a string
+of at most 4096 bytes, a number, a boolean or null: an array or an object is skipped with `IgnoredAny`
+(nothing is kept) and an over-long string is dropped, and either one is a CEL error, the same kind of error a
+missing key is, so `coalesce(json(x).f, -1)` falls back. The last occurrence of a repeated key still decides.
+A value that is accepted is converted exactly as before.
+
+Files: `crates/celx/src/general.rs` (the fix), `crates/celx/src/function_tests.rs` (six unit tests whose names
+start `json_field_`) and the new `crates/celx/tests/json_field_memory.rs` (a counting global allocator
+measures the peak while `jsonField` reads `model` from a crafted 8 MiB body; it must stay under twice the body).
 
 ## Why
 

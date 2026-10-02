@@ -438,7 +438,15 @@ fn coalesce<'a>(ftx: &mut FunctionContext<'a, '_>) -> ResolveResult<'a> {
 mod json_field {
 	use std::fmt;
 
-	use serde::de::{Error, IgnoredAny, MapAccess, Visitor};
+	use serde::de::{
+		DeserializeSeed, Deserializer, Error, IgnoredAny, MapAccess, SeqAccess, Visitor,
+	};
+
+	/// The longest string `jsonField` returns, in bytes. A body field read this way is a model name
+	/// or a token count, which is tens of bytes, so 4 KiB is far above any real value. Policies
+	/// read these fields before the caller is authenticated, so a field that is not tiny is refused
+	/// instead of being copied.
+	const MAX_STRING_BYTES: usize = 4096;
 
 	impl FieldExtractor {
 		pub fn new(field_name: &str) -> FieldExtractor {
@@ -447,6 +455,120 @@ mod json_field {
 	}
 
 	pub struct FieldExtractor(String);
+
+	/// What the selected key held: a scalar to hand on, or the reason it is not handed on.
+	enum Field {
+		Scalar(serde_json::Value),
+		Refused(Refusal),
+	}
+
+	enum Refusal {
+		Array,
+		Object,
+		LongString(usize),
+	}
+
+	impl fmt::Display for Refusal {
+		fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+			match self {
+				Refusal::Array => {
+					f.write_str("the field is an array; only a string, number, boolean or null is read")
+				},
+				Refusal::Object => {
+					f.write_str("the field is an object; only a string, number, boolean or null is read")
+				},
+				Refusal::LongString(len) => write!(
+					f,
+					"the field is a string of {len} bytes, over the {MAX_STRING_BYTES} byte limit"
+				),
+			}
+		}
+	}
+
+	/// Reads the value of the selected key without building anything larger than a short string:
+	/// a scalar becomes the same `serde_json::Value` the full parse produced, and an array or an
+	/// object is skipped (`IgnoredAny` keeps nothing) and reported as refused.
+	struct Scalar;
+
+	impl<'de> DeserializeSeed<'de> for Scalar {
+		type Value = Field;
+
+		fn deserialize<D>(self, deserializer: D) -> Result<Field, D::Error>
+		where
+			D: Deserializer<'de>,
+		{
+			deserializer.deserialize_any(self)
+		}
+	}
+
+	impl<'de> Visitor<'de> for Scalar {
+		type Value = Field;
+
+		fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+			formatter.write_str("a JSON value")
+		}
+
+		fn visit_bool<E>(self, v: bool) -> Result<Field, E>
+		where
+			E: Error,
+		{
+			Ok(Field::Scalar(serde_json::Value::Bool(v)))
+		}
+
+		fn visit_i64<E>(self, v: i64) -> Result<Field, E>
+		where
+			E: Error,
+		{
+			Ok(Field::Scalar(v.into()))
+		}
+
+		fn visit_u64<E>(self, v: u64) -> Result<Field, E>
+		where
+			E: Error,
+		{
+			Ok(Field::Scalar(v.into()))
+		}
+
+		fn visit_f64<E>(self, v: f64) -> Result<Field, E>
+		where
+			E: Error,
+		{
+			Ok(Field::Scalar(v.into()))
+		}
+
+		fn visit_str<E>(self, v: &str) -> Result<Field, E>
+		where
+			E: Error,
+		{
+			if v.len() > MAX_STRING_BYTES {
+				return Ok(Field::Refused(Refusal::LongString(v.len())));
+			}
+			Ok(Field::Scalar(serde_json::Value::String(v.to_owned())))
+		}
+
+		fn visit_unit<E>(self) -> Result<Field, E>
+		where
+			E: Error,
+		{
+			Ok(Field::Scalar(serde_json::Value::Null))
+		}
+
+		fn visit_seq<A>(self, mut seq: A) -> Result<Field, A::Error>
+		where
+			A: SeqAccess<'de>,
+		{
+			while seq.next_element::<IgnoredAny>()?.is_some() {}
+			Ok(Field::Refused(Refusal::Array))
+		}
+
+		fn visit_map<A>(self, mut map: A) -> Result<Field, A::Error>
+		where
+			A: MapAccess<'de>,
+		{
+			while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+			Ok(Field::Refused(Refusal::Object))
+		}
+	}
 
 	impl<'de> Visitor<'de> for FieldExtractor {
 		type Value = Option<cel::Value<'static>>;
@@ -459,19 +581,23 @@ mod json_field {
 		where
 			A: MapAccess<'de>,
 		{
-			let mut val = None;
+			// The last occurrence of the key decides, as before: a refused value is an error only
+			// when no later occurrence of the key replaces it.
+			let mut selected = None;
 			while let Some(key) = map.next_key::<String>()? {
 				if key == self.0 {
-					let value = map.next_value::<serde_json::Value>()?;
-					let value = cel::to_value(value).map_err(A::Error::custom)?;
-					val = Some(value);
+					selected = Some(map.next_value_seed(Scalar)?);
 				} else {
 					map.next_value::<IgnoredAny>()?;
 				}
 				// Do not recurse into the values, we only allow top level access right now
 			}
 
-			Ok(val)
+			match selected {
+				None => Ok(None),
+				Some(Field::Scalar(value)) => cel::to_value(value).map(Some).map_err(A::Error::custom),
+				Some(Field::Refused(refusal)) => Err(A::Error::custom(refusal)),
+			}
 		}
 	}
 }

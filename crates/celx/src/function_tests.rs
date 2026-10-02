@@ -90,6 +90,95 @@ fn json_field() {
 }
 
 #[test]
+fn json_field_returns_each_scalar_type_unchanged() {
+	assert(
+		json!("llama-3"),
+		r#"jsonField('{"model":"llama-3"}', "model")"#,
+	);
+	assert(json!(""), r#"jsonField('{"model":""}', "model")"#);
+	assert(json!(16), r#"jsonField('{"max_tokens":16}', "max_tokens")"#);
+	assert(json!(-1), r#"jsonField('{"max_tokens":-1}', "max_tokens")"#);
+	assert(
+		json!(0.5),
+		r#"jsonField('{"temperature":0.5}', "temperature")"#,
+	);
+	assert(json!(true), r#"jsonField('{"stream":true}', "stream")"#);
+	assert(json!(false), r#"jsonField('{"stream":false}', "stream")"#);
+	assert(json!(null), r#"jsonField('{"model":null}', "model")"#);
+	// The form the edge policies write, which the optimizer rewrites to the call above.
+	assert(json!("llama-3"), r#"json('{"model":"llama-3"}').model"#);
+}
+
+#[test]
+fn json_field_refuses_an_array_or_an_object_and_says_which() {
+	assert_fails_saying(r#"jsonField('{"model":[1,2]}', "model")"#, "array");
+	assert_fails_saying(r#"jsonField('{"model":[]}', "model")"#, "array");
+	assert_fails_saying(r#"jsonField('{"model":{"a":[1]}}', "model")"#, "object");
+	assert_fails_saying(r#"jsonField('{"model":{}}', "model")"#, "object");
+	// The optimizer's rewrite refuses where the full parse of `json(x)` alone would return the list.
+	assert_fails_saying(r#"json('{"model":[1]}').model"#, "array");
+}
+
+#[test]
+fn json_field_that_is_refused_lets_coalesce_fall_back_like_a_missing_key() {
+	// Evaluated as the proxy does, with the optimizer's rewrite only: `eval` would also run the
+	// unrewritten full parse, which reads the whole value and so disagrees by design.
+	for body in [
+		r#"{"max_tokens":[1]}"#,
+		r#"{"max_tokens":{"a":1}}"#,
+		r#"{"other":1}"#,
+	] {
+		let expr = format!(r#"coalesce(json('{body}').max_tokens, -1)"#);
+		eval_non_static(&expr, |r| assert_eq!(r.json().unwrap(), json!(-1))).unwrap();
+	}
+	let expr = r#"coalesce(json('{"max_tokens":7}').max_tokens, -1)"#;
+	eval_non_static(expr, |r| assert_eq!(r.json().unwrap(), json!(7))).unwrap();
+}
+
+#[test]
+fn json_field_reads_a_string_of_the_bound_and_refuses_one_byte_more() {
+	// The bound is 4096 bytes (`MAX_STRING_BYTES` in general.rs), counted in bytes and not characters.
+	let at_bound = "m".repeat(4096);
+	let expr = format!(r#"jsonField('{{"model":"{at_bound}"}}', "model")"#);
+	assert(json!(at_bound), &expr);
+
+	let over = "m".repeat(4097);
+	let expr = format!(r#"jsonField('{{"model":"{over}"}}', "model")"#);
+	assert_fails_saying(&expr, "4097 bytes");
+
+	// 1366 characters of three bytes each are 4098 bytes.
+	let wide = "\u{20ac}".repeat(1366);
+	let expr = format!(r#"jsonField('{{"model":"{wide}"}}', "model")"#);
+	assert_fails_saying(&expr, "4098 bytes");
+}
+
+#[test]
+fn json_field_finds_a_key_after_a_large_value_it_did_not_select() {
+	let items = r#"{"a":[1,2,{"b":null}]},"#.repeat(500);
+	let body = format!(r#"{{"model":[{items}{{}}],"max_tokens":16,"stop":"x"}}"#);
+	assert(json!(16), &format!(r#"jsonField('{body}', "max_tokens")"#));
+	assert(json!("x"), &format!(r#"jsonField('{body}', "stop")"#));
+	// The same value, selected, is refused; the keys around it are not affected.
+	assert_fails_saying(&format!(r#"jsonField('{body}', "model")"#), "array");
+}
+
+#[test]
+fn json_field_takes_the_last_occurrence_of_a_repeated_key_as_before() {
+	assert(
+		json!("b"),
+		r#"jsonField('{"model":[1],"model":"b"}', "model")"#,
+	);
+	assert(
+		json!("b"),
+		r#"jsonField('{"model":"a","model":"b"}', "model")"#,
+	);
+	assert_fails_saying(
+		r#"jsonField('{"model":"a","model":[1]}', "model")"#,
+		"array",
+	);
+}
+
+#[test]
 fn unvalidated_jwt_payload() {
 	let expr = r#"unvalidatedJwtPayload("eyJhbGciOiJub25lIn0.eyJzdWIiOiIxMjMiLCJhZG1pbiI6dHJ1ZX0.")"#;
 	assert(json!({"sub": "123", "admin": true}), expr);
@@ -687,6 +776,14 @@ fn assert(want: serde_json::Value, expr: &str) {
 
 fn assert_fails(expr: &str) {
 	assert!(eval(expr).is_err(), "expression: {expr}");
+}
+
+fn assert_fails_saying(expr: &str, reason: &str) {
+	let err = eval(expr).expect_err(expr);
+	assert!(
+		err.to_string().contains(reason),
+		"expression: {expr}: the error does not say {reason:?}: {err}"
+	);
 }
 
 #[derive(Debug, Clone, cel::DynamicType)]
