@@ -5246,25 +5246,41 @@ mod body_streaming_and_trailers {
 		);
 	}
 
-	// How the stream of requests of an ext_proc call ended, as its server saw it: cleanly (the client
-	// half-closed it, which is how a call that was processed to its end finishes), or by failing (the
-	// client cancelled the call, which is what a client that left must cause).
+	// How an ext_proc call ended, as its server saw it. A call the client half-closed (which is how a
+	// call that was processed to its end finishes) leaves the server's response stream open for the client
+	// to read. A call the client cancelled (RST_STREAM with CANCEL, which is what a client that left must
+	// cause) has that response stream dropped by the server's connection at once. The server's request
+	// stream cannot tell the two apart: tonic reports a cancelled request body as the end of the stream.
 	#[derive(Default)]
 	struct CallEnd {
-		clean: std::sync::atomic::AtomicBool,
+		reset: std::sync::atomic::AtomicBool,
 		failed: std::sync::Mutex<Option<tonic::Code>>,
 		ended: tokio::sync::Notify,
+	}
+
+	impl CallEnd {
+		fn cancelled(&self) -> bool {
+			self.reset.load(std::sync::atomic::Ordering::SeqCst) || self.failed.lock().unwrap().is_some()
+		}
 	}
 
 	struct WatchCall(Arc<CallEnd>);
 
 	#[async_trait::async_trait]
 	impl Handler for WatchCall {
-		async fn on_eof(&mut self) {
+		async fn on_eof(
+			&mut self,
+			response_stream: &mpsc::Sender<Result<proto::ProcessingResponse, tonic::Status>>,
+		) {
+			// Waiting keeps the server's end of the call open: a half-closed call keeps its response
+			// stream for the whole wait, a cancelled one loses it within it.
+			let reset = tokio::time::timeout(Duration::from_millis(500), response_stream.closed())
+				.await
+				.is_ok();
 			self
 				.0
-				.clean
-				.store(true, std::sync::atomic::Ordering::SeqCst);
+				.reset
+				.store(reset, std::sync::atomic::Ordering::SeqCst);
 			self.0.ended.notify_one();
 		}
 
@@ -5276,8 +5292,8 @@ mod body_streaming_and_trailers {
 
 	// A client that leaves mid-stream drops the processed response body. Everything still working for
 	// that body must stop: the read of the upstream body (so the upstream request is cancelled) and the
-	// call to the ext_proc server, which must be cancelled (its server sees the call fail) and not
-	// ended cleanly, which is how a call that finished looks.
+	// call to the ext_proc server, which must be cancelled (its server loses the response stream of the
+	// call at once) and not half-closed, which is how a call that finished looks.
 	#[tokio::test]
 	async fn dropping_the_response_cancels_the_upstream_and_the_ext_proc_call() {
 		let call = Arc::new(CallEnd::default());
@@ -5307,19 +5323,15 @@ mod body_streaming_and_trailers {
 		// The client leaves.
 		drop(resp);
 
-		tokio::time::timeout(Duration::from_secs(2), async {
+		tokio::time::timeout(Duration::from_secs(5), async {
 			upstream.closed().await;
 			call.ended.notified().await;
 		})
 		.await
-		.expect("the upstream body must be dropped and the ext_proc call must end within 2s");
+		.expect("the upstream body must be dropped and the ext_proc call must end within 5s");
 		assert!(
-			!call.clean.load(std::sync::atomic::Ordering::SeqCst),
-			"the ext_proc server saw its stream of requests end cleanly: the call was half-closed, not cancelled"
-		);
-		assert!(
-			call.failed.lock().unwrap().is_some(),
-			"the ext_proc server must see its call fail when the client leaves"
+			call.cancelled(),
+			"the ext_proc server kept the response stream of the call open: the call was half-closed, not cancelled"
 		);
 		// Held until here, so the call can only have ended because the response body was dropped, not
 		// because the policy was.
@@ -5354,16 +5366,12 @@ mod body_streaming_and_trailers {
 		let body = read_body_raw(resp.into_body()).await;
 		assert_eq!(body.as_ref(), b"upstream-response");
 
-		tokio::time::timeout(Duration::from_secs(2), call.ended.notified())
+		tokio::time::timeout(Duration::from_secs(5), call.ended.notified())
 			.await
-			.expect("the ext_proc stream must end within 2s of the response being read to its end");
+			.expect("the ext_proc stream must end within 5s of the response being read to its end");
 		assert!(
-			call.clean.load(std::sync::atomic::Ordering::SeqCst),
-			"the ext_proc server must see the stream of requests end cleanly"
-		);
-		assert!(
-			call.failed.lock().unwrap().is_none(),
-			"a response that was processed to its end must not look like a cancelled call"
+			!call.cancelled(),
+			"a response that was processed to its end must close the call cleanly, not cancel it"
 		);
 		drop(ext_proc_request);
 	}

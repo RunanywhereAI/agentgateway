@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use http_body::{Body as _, Frame, SizeHint};
+use http_body::{Frame, SizeHint};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::http;
