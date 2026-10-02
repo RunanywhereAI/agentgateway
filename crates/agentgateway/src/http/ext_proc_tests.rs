@@ -5245,6 +5245,59 @@ mod body_streaming_and_trailers {
 			"response trailers should arrive after response body chunks"
 		);
 	}
+
+	// A client that leaves mid-stream drops the processed response body. Everything still working for
+	// that body must stop: the read of the upstream body (so the upstream request is cancelled) and
+	// the stream of requests to the ext_proc server (so the server sees its end).
+	#[tokio::test]
+	async fn dropping_the_response_cancels_the_upstream_and_ends_the_ext_proc_stream() {
+		struct StreamEnd(Arc<tokio::sync::Notify>);
+
+		#[async_trait::async_trait]
+		impl Handler for StreamEnd {
+			async fn on_eof(&mut self) {
+				self.0.notify_one();
+			}
+		}
+
+		let ended = Arc::new(tokio::sync::Notify::new());
+		let observed = ended.clone();
+		let ext_proc = ExtProcMock::new(move || StreamEnd(observed.clone()))
+			.spawn()
+			.await;
+		let mut ext_proc_request = build_ext_proc_request_for_test(
+			ext_proc.address,
+			ext_proc::ProcessingOptions {
+				response_body_mode: ext_proc::BodySendMode::FullDuplexStreamed,
+				..Default::default()
+			},
+		);
+
+		// The upstream body is a channel nothing sends on and nothing closes: only its reader being
+		// dropped can close it from the other side.
+		let (upstream, upstream_frames) =
+			mpsc::channel::<Result<Frame<bytes::Bytes>, Infallible>>(1);
+		let mut resp = http::Response::new(Body::new(http_body_util::StreamBody::new(
+			tokio_stream::wrappers::ReceiverStream::new(upstream_frames),
+		)));
+		let _ = ext_proc_request
+			.mutate_response(&mut resp, None)
+			.await
+			.unwrap();
+
+		// The client leaves.
+		drop(resp);
+
+		tokio::time::timeout(Duration::from_secs(2), async {
+			upstream.closed().await;
+			ended.notified().await;
+		})
+		.await
+		.expect("the upstream body must be dropped and the ext_proc stream must end within 2s");
+		// Held until here, so the stream can only have ended because the response body was dropped,
+		// not because the policy was.
+		drop(ext_proc_request);
+	}
 }
 
 // CEL metadata_context and ext_proc request/response attribute evaluation.
