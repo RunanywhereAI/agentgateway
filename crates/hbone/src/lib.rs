@@ -22,6 +22,13 @@ pub mod server;
 /// Default HBONE mTLS port used when no explicit port is configured.
 pub const DEFAULT_HBONE_PORT: u16 = 15008;
 
+/// The error to end an HTTP/2 request body with when the call it belongs to is cancelled. hyper resets
+/// the stream with the reason of the first `h2::Error` in the chain of a failed body's error, so the
+/// peer sees RST_STREAM(CANCEL) (a cancelled call, for gRPC) and not a clean end of the stream.
+pub fn cancelled() -> h2::Error {
+	h2::Error::from(Reason::CANCEL)
+}
+
 pub trait Key: Display + Clone + Hash + Debug + PartialEq + Eq + Send + Sync + 'static {
 	fn dest(&self) -> SocketAddr;
 }

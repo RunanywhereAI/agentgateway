@@ -86,6 +86,7 @@ use buffering::{
 	BufferedBodyPhase, PendingBufferedBody, attach_request_body_channel,
 	debug_assert_preserved_request_body, start_buffered_request_body, start_buffered_response_body,
 };
+use channel::AbortableChannel;
 pub use channel::GrpcReferenceChannel;
 use headers::{req_to_header_map, resp_to_header_map, to_header_map};
 #[cfg(test)]
@@ -384,7 +385,7 @@ struct ExtProcInstance {
 	mode_state: ModeStateMachine,
 	span_client: PolicyClient,
 	span_target: Arc<SimpleBackendReference>,
-	client: Option<proto::external_processor_client::ExternalProcessorClient<GrpcReferenceChannel>>,
+	client: Option<proto::external_processor_client::ExternalProcessorClient<AbortableChannel>>,
 	tx_req: Option<Sender<ProcessingRequest>>,
 	rx_resp_for_request: Option<Receiver<ProcessingResponse>>,
 	rx_resp_for_response: Option<Receiver<ProcessingResponse>>,
@@ -396,6 +397,53 @@ struct ExtProcInstance {
 	// of the upstream body, the response continuation and the stream of requests to the ext_proc
 	// server.
 	cancel: CancellationToken,
+	// Cancelled, just before `cancel`, when the response body this instance returned is dropped while
+	// the ext_proc processing of it is still running, which is when the client has left. The call to
+	// the ext_proc server is then cancelled (its HTTP/2 stream is reset with CANCEL, and the server
+	// sees a cancelled call), where `cancel` alone ends the stream of requests cleanly, as it should
+	// for a response that was processed to its end.
+	abort: CancellationToken,
+}
+
+/// The response body an instance returns: the processed body, and what decides how the ext_proc call
+/// ends when the body is dropped. If the processing of the body is still running (a sender of its
+/// channel is alive) the client has left, so the call is aborted; either way everything the instance
+/// still runs for the body is then cancelled. `drop` runs before the fields are dropped: it is
+/// decided while the body still holds its channel (so the senders have not been told to stop), and
+/// `abort` is cancelled before the stream of requests is ended.
+struct ProcessedResponse {
+	body: http::Body,
+	senders: tokio::sync::mpsc::WeakSender<Result<Frame<Bytes>, Infallible>>,
+	abort: CancellationToken,
+	_cancel: tokio_util::sync::DropGuard,
+}
+
+impl Drop for ProcessedResponse {
+	fn drop(&mut self) {
+		if self.senders.upgrade().is_some() {
+			self.abort.cancel();
+		}
+	}
+}
+
+impl Body for ProcessedResponse {
+	type Data = Bytes;
+	type Error = <http::Body as Body>::Error;
+
+	fn poll_frame(
+		mut self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+		std::pin::Pin::new(&mut self.body).poll_frame(cx)
+	}
+
+	fn is_end_stream(&self) -> bool {
+		self.body.is_end_stream()
+	}
+
+	fn size_hint(&self) -> http_body::SizeHint {
+		self.body.size_hint()
+	}
 }
 
 impl ExtProcInstance {
@@ -412,7 +460,11 @@ impl ExtProcInstance {
 		trace!("connecting to {:?}", target.target);
 		let client = client.with_outbound(OutboundCallKind::Policy, OutboundCallSubtype::ExtProc);
 		let span_target = target.target.clone();
-		let chan = target.grpc_channel(client.clone());
+		let abort = CancellationToken::new();
+		let chan = AbortableChannel {
+			inner: target.grpc_channel(client.clone()),
+			abort: abort.clone(),
+		};
 		Self {
 			skipped: Default::default(),
 			request_body_immediate_response: Arc::new(Mutex::new(None)),
@@ -432,6 +484,7 @@ impl ExtProcInstance {
 			req_attributes,
 			resp_attributes,
 			cancel: CancellationToken::new(),
+			abort,
 		}
 	}
 
@@ -457,6 +510,7 @@ impl ExtProcInstance {
 			tokio_stream::wrappers::ReceiverStream::new(rx_req),
 			self.cancel.clone().cancelled_owned(),
 		);
+		let abort = self.abort.clone();
 		dtrace::spawn(async move {
 			let mut request = tonic::Request::new(req_stream);
 			*request.metadata_mut() = grpc_initial_metadata;
@@ -465,7 +519,18 @@ impl ExtProcInstance {
 				span_target.as_ref(),
 				"/envoy.service.ext_proc.v3.ExternalProcessor/Process",
 			);
-			let responses = match client.process(request).await {
+			// Dropping the call before it is established cancels it, and so does dropping the stream of
+			// responses once it is: the abort also fails the request body, which resets the stream.
+			let call = client.process(request);
+			let established = tokio::select! {
+				biased;
+				_ = abort.cancelled() => {
+					trace!("ext_proc call cancelled before it was established: the client left");
+					return;
+				},
+				established = call => established,
+			};
+			let responses = match established {
 				Ok(r) => r,
 				Err(e) => {
 					if let Some(span) = span.as_deref_mut() {
@@ -478,7 +543,18 @@ impl ExtProcInstance {
 			trace!("initial stream established");
 			let mut responses = responses.into_inner();
 			loop {
-				match responses.message().await {
+				let message = tokio::select! {
+					biased;
+					_ = abort.cancelled() => {
+						if let Some(span) = span.as_deref_mut() {
+							span.record_grpc_status(tonic::Code::Cancelled);
+						}
+						trace!("ext_proc call cancelled: the client left");
+						return;
+					},
+					message = responses.message() => message,
+				};
+				match message {
 					Ok(Some(item)) => {
 						trace!("received response item {item:?}");
 						if tx_resp.send(item).await.is_err() {
@@ -1466,6 +1542,8 @@ impl ExtProcInstance {
 		let mut pending_response_buffer = None;
 		// Now we need to build the new body. This is going to be streamed in from the ext_proc server.
 		let (mut tx_chunk, rx_chunk) = tokio::sync::mpsc::channel(1);
+		// Tells, once the body is dropped, whether the processing of it was over (no sender left).
+		let processing_senders = tx_chunk.downgrade();
 		let body = http_body_util::StreamBody::new(ReceiverStream::new(rx_chunk));
 		let mut resp = http::Response::from_parts(parts, http::Body::new(body));
 		// Held until the processed response is handed back: a failure or an immediate response on the way
@@ -1662,9 +1740,14 @@ impl ExtProcInstance {
 					resp.headers_mut().remove(http::header::CONTENT_LENGTH);
 				}
 				// From here on, whoever drops the body (the client left, or the response is over) cancels
-				// what this instance still does for it: see `cancel`.
+				// what this instance still does for it: see `cancel`, and `abort` for a client that left.
 				let (parts, body) = resp.into_parts();
-				let body = http::DropBody::new(body, cancel_on_exit);
+				let body = http::Body::new(ProcessedResponse {
+					body,
+					senders: processing_senders,
+					abort: self.abort.clone(),
+					_cancel: cancel_on_exit,
+				});
 				return Ok((http::Response::from_parts(parts, body), None));
 			}
 		}

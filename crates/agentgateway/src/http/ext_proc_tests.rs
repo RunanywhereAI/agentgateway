@@ -5246,23 +5246,43 @@ mod body_streaming_and_trailers {
 		);
 	}
 
-	// A client that leaves mid-stream drops the processed response body. Everything still working for
-	// that body must stop: the read of the upstream body (so the upstream request is cancelled) and
-	// the stream of requests to the ext_proc server (so the server sees its end).
-	#[tokio::test]
-	async fn dropping_the_response_cancels_the_upstream_and_ends_the_ext_proc_stream() {
-		struct StreamEnd(Arc<tokio::sync::Notify>);
+	// How the stream of requests of an ext_proc call ended, as its server saw it: cleanly (the client
+	// half-closed it, which is how a call that was processed to its end finishes), or by failing (the
+	// client cancelled the call, which is what a client that left must cause).
+	#[derive(Default)]
+	struct CallEnd {
+		clean: std::sync::atomic::AtomicBool,
+		failed: std::sync::Mutex<Option<tonic::Code>>,
+		ended: tokio::sync::Notify,
+	}
 
-		#[async_trait::async_trait]
-		impl Handler for StreamEnd {
-			async fn on_eof(&mut self) {
-				self.0.notify_one();
-			}
+	struct WatchCall(Arc<CallEnd>);
+
+	#[async_trait::async_trait]
+	impl Handler for WatchCall {
+		async fn on_eof(&mut self) {
+			self
+				.0
+				.clean
+				.store(true, std::sync::atomic::Ordering::SeqCst);
+			self.0.ended.notify_one();
 		}
 
-		let ended = Arc::new(tokio::sync::Notify::new());
-		let observed = ended.clone();
-		let ext_proc = ExtProcMock::new(move || StreamEnd(observed.clone()))
+		async fn on_stream_error(&mut self, status: &tonic::Status) {
+			*self.0.failed.lock().unwrap() = Some(status.code());
+			self.0.ended.notify_one();
+		}
+	}
+
+	// A client that leaves mid-stream drops the processed response body. Everything still working for
+	// that body must stop: the read of the upstream body (so the upstream request is cancelled) and the
+	// call to the ext_proc server, which must be cancelled (its server sees the call fail) and not
+	// ended cleanly, which is how a call that finished looks.
+	#[tokio::test]
+	async fn dropping_the_response_cancels_the_upstream_and_the_ext_proc_call() {
+		let call = Arc::new(CallEnd::default());
+		let observed = call.clone();
+		let ext_proc = ExtProcMock::new(move || WatchCall(observed.clone()))
 			.spawn()
 			.await;
 		let mut ext_proc_request = build_ext_proc_request_for_test(
@@ -5275,8 +5295,7 @@ mod body_streaming_and_trailers {
 
 		// The upstream body is a channel nothing sends on and nothing closes: only its reader being
 		// dropped can close it from the other side.
-		let (upstream, upstream_frames) =
-			mpsc::channel::<Result<Frame<bytes::Bytes>, Infallible>>(1);
+		let (upstream, upstream_frames) = mpsc::channel::<Result<Frame<bytes::Bytes>, Infallible>>(1);
 		let mut resp = http::Response::new(Body::new(http_body_util::StreamBody::new(
 			tokio_stream::wrappers::ReceiverStream::new(upstream_frames),
 		)));
@@ -5290,12 +5309,62 @@ mod body_streaming_and_trailers {
 
 		tokio::time::timeout(Duration::from_secs(2), async {
 			upstream.closed().await;
-			ended.notified().await;
+			call.ended.notified().await;
 		})
 		.await
-		.expect("the upstream body must be dropped and the ext_proc stream must end within 2s");
-		// Held until here, so the stream can only have ended because the response body was dropped,
-		// not because the policy was.
+		.expect("the upstream body must be dropped and the ext_proc call must end within 2s");
+		assert!(
+			!call.clean.load(std::sync::atomic::Ordering::SeqCst),
+			"the ext_proc server saw its stream of requests end cleanly: the call was half-closed, not cancelled"
+		);
+		assert!(
+			call.failed.lock().unwrap().is_some(),
+			"the ext_proc server must see its call fail when the client leaves"
+		);
+		// Held until here, so the call can only have ended because the response body was dropped, not
+		// because the policy was.
+		drop(ext_proc_request);
+	}
+
+	// The counterpart: a response that was processed to its end is not a client that left. Its call
+	// finishes cleanly, as it does without the cancellation, and the server sees no failure.
+	#[tokio::test]
+	async fn a_response_read_to_its_end_closes_the_ext_proc_stream_cleanly() {
+		let call = Arc::new(CallEnd::default());
+		let observed = call.clone();
+		let ext_proc = ExtProcMock::new(move || WatchCall(observed.clone()))
+			.spawn()
+			.await;
+		let mut ext_proc_request = build_ext_proc_request_for_test(
+			ext_proc.address,
+			ext_proc::ProcessingOptions {
+				response_body_mode: ext_proc::BodySendMode::FullDuplexStreamed,
+				..Default::default()
+			},
+		);
+
+		let frames = tokio_stream::iter(vec![Ok::<Frame<bytes::Bytes>, Infallible>(Frame::data(
+			bytes::Bytes::from_static(b"upstream-response"),
+		))]);
+		let mut resp = http::Response::new(Body::new(http_body_util::StreamBody::new(frames)));
+		let _ = ext_proc_request
+			.mutate_response(&mut resp, None)
+			.await
+			.unwrap();
+		let body = read_body_raw(resp.into_body()).await;
+		assert_eq!(body.as_ref(), b"upstream-response");
+
+		tokio::time::timeout(Duration::from_secs(2), call.ended.notified())
+			.await
+			.expect("the ext_proc stream must end within 2s of the response being read to its end");
+		assert!(
+			call.clean.load(std::sync::atomic::Ordering::SeqCst),
+			"the ext_proc server must see the stream of requests end cleanly"
+		);
+		assert!(
+			call.failed.lock().unwrap().is_none(),
+			"a response that was processed to its end must not look like a cancelled call"
+		);
 		drop(ext_proc_request);
 	}
 }
