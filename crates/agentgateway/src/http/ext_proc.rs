@@ -13,6 +13,7 @@ use protos::envoy::service::ext_proc::v3::ProtocolConfiguration;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::cel::{Executor, Expression, RequestSnapshot};
 use crate::client::ResolvedDestination;
@@ -412,6 +413,11 @@ struct ExtProcInstance {
 	metadata_context: Option<HashMap<String, HashMap<String, Arc<cel::Expression>>>>,
 	req_attributes: Option<HashMap<String, Arc<cel::Expression>>>,
 	resp_attributes: Option<HashMap<String, Arc<cel::Expression>>>,
+	// Cancelled when the response body this instance returned is dropped, which is when the client
+	// has gone (or the response is over). It stops everything still running for that body: the read
+	// of the upstream body, the response continuation and the stream of requests to the ext_proc
+	// server.
+	cancel: CancellationToken,
 }
 
 impl ExtProcInstance {
@@ -449,6 +455,7 @@ impl ExtProcInstance {
 			metadata_context,
 			req_attributes,
 			resp_attributes,
+			cancel: CancellationToken::new(),
 		}
 	}
 
@@ -480,6 +487,10 @@ impl ExtProcInstance {
 			}
 			rx_req.poll_recv(cx)
 		});
+		// The stream of requests ends when the response body is dropped, although the senders of its
+		// channel stay alive in this instance: the ext_proc server then sees the end of the stream.
+		let req_stream =
+			futures_util::StreamExt::take_until(req_stream, self.cancel.clone().cancelled_owned());
 		dtrace::spawn(async move {
 			let mut request = tonic::Request::new(req_stream);
 			*request.metadata_mut() = grpc_initial_metadata;
@@ -727,7 +738,7 @@ impl ExtProcInstance {
 		first_message: FirstExtProcMessage,
 		missing_body_message: &'static str,
 	) {
-		tokio::task::spawn(Self::handle_body_stream(
+		let read = Self::handle_body_stream(
 			metadata_context.clone(),
 			pending_body.take().expect(missing_body_message),
 			tx,
@@ -735,7 +746,23 @@ impl ExtProcInstance {
 			send_trailers,
 			trailer_slot,
 			first_message,
-		));
+		);
+		if !matches!(body_direction, BodyStreamDirection::Response) {
+			tokio::task::spawn(read);
+			return;
+		}
+		let cancel = self.cancel.clone();
+		tokio::task::spawn(async move {
+			// Dropping the read drops the body it holds, which for a response is the upstream body, and
+			// dropping that cancels the upstream request.
+			tokio::select! {
+				biased;
+				_ = cancel.cancelled() => {
+					trace!("response body stream cancelled: the processed body was dropped");
+				},
+				_ = read => {},
+			}
+		});
 	}
 
 	async fn recv_response_loop_message(
@@ -860,6 +887,32 @@ impl ExtProcInstance {
 				return;
 			}
 		}
+	}
+
+	/// Runs the response continuation until it is over or `cancel` is cancelled, which is when the
+	/// processed response body is dropped (see `ExtProcInstance::cancel`).
+	fn spawn_response_continuation(
+		cancel: CancellationToken,
+		rx: Receiver<ProcessingResponse>,
+		tx_chunk: Sender<Result<Frame<Bytes>, Infallible>>,
+		response_trailers: Arc<Mutex<Option<http::HeaderMap>>>,
+		send_response_headers: bool,
+	) {
+		tokio::task::spawn(async move {
+			tokio::select! {
+				biased;
+				_ = cancel.cancelled() => {
+					trace!("response continuation cancelled: the processed body was dropped");
+				},
+				_ = Self::forward_response_stream_continuation(
+					rx,
+					tx_chunk,
+					response_trailers,
+					true,
+					send_response_headers,
+				) => {},
+			}
+		});
 	}
 
 	fn protocol_config(&self) -> ProtocolConfiguration {
@@ -1568,6 +1621,9 @@ impl ExtProcInstance {
 		let body = http_body_util::StreamBody::new(ReceiverStream::new(rx_chunk));
 		managed_body.replace_content(agent_http::RawBody::new(body).into());
 		let mut resp = http::Response::from_parts(parts, managed_body);
+		// Held until the processed response is handed back: a failure or an immediate response on the way
+		// cancels what was started for the body (see `cancel`), and a return of the original body does not.
+		let cancel_on_exit = self.cancel.clone().drop_guard();
 
 		// FULL_DUPLEX_STREAMED sends response body chunks as they arrive. The ext_proc server may
 		// buffer the response headers and complete body before sending any response, so do not wait
@@ -1701,10 +1757,12 @@ impl ExtProcInstance {
 						if let Some(original_body) =
 							BufferedBodyPhase::take_deferred_body(&mut pending_response_buffer)
 						{
+							drop(cancel_on_exit.disarm());
 							resp.body_mut().restore_content(original_body);
 							return Ok((resp, None));
 						}
 						if let Some(original_body) = pending_response_body.take() {
+							drop(cancel_on_exit.disarm());
 							resp.body_mut().restore_content(original_body);
 							return Ok((resp, None));
 						}
@@ -1740,13 +1798,13 @@ impl ExtProcInstance {
 						self.mark_protocol_config_sent_if(sends_protocol_config);
 					}
 					response_fsm.enter_streaming_continuation();
-					tokio::task::spawn(Self::forward_response_stream_continuation(
+					Self::spawn_response_continuation(
+						self.cancel.clone(),
 						rx,
 						tx_chunk,
 						response_trailers.clone(),
-						true,
 						send_response_headers,
-					));
+					);
 				} else if !eos
 					&& response_fsm.send_body
 					&& response_fsm.body_path == BodyPath::Buffered
@@ -1756,13 +1814,13 @@ impl ExtProcInstance {
 						.is_some()
 				{
 					response_fsm.enter_streaming_continuation();
-					tokio::task::spawn(Self::forward_response_stream_continuation(
+					Self::spawn_response_continuation(
+						self.cancel.clone(),
 						rx,
 						tx_chunk,
 						response_trailers.clone(),
-						true,
 						send_response_headers,
-					));
+					);
 				}
 				if response_fsm.send_body
 					&& (response_fsm
@@ -1772,7 +1830,11 @@ impl ExtProcInstance {
 				{
 					resp.headers_mut().remove(http::header::CONTENT_LENGTH);
 				}
-				return Ok((resp, None));
+				// From here on, whoever drops the body (the client left, or the response is over) cancels
+				// what this instance still does for it: see `cancel`.
+				let (parts, body) = resp.into_parts();
+				let body = body.with_drop_guard(cancel_on_exit);
+				return Ok((http::Response::from_parts(parts, body), None));
 			}
 		}
 	}

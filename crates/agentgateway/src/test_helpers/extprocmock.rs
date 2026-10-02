@@ -94,6 +94,9 @@ pub trait Handler {
 		false
 	}
 
+	/// Called when the client ends its stream of requests cleanly, after the last request.
+	async fn on_eof(&mut self) {}
+
 	async fn handle_request_headers(
 		&mut self,
 		_headers: &HttpHeaders,
@@ -277,6 +280,7 @@ where
 						return Ok::<(), Status>(());
 					}
 				}
+				handler.on_eof().await;
 				Ok::<(), Status>(())
 			}
 			.await;
