@@ -97,6 +97,10 @@ pub trait Handler {
 	/// Called when the client ends its stream of requests cleanly, after the last request.
 	async fn on_eof(&mut self) {}
 
+	/// Called when the stream of requests fails instead of ending, which is what a server sees when the
+	/// client cancels the call (the HTTP/2 stream is reset).
+	async fn on_stream_error(&mut self, _status: &Status) {}
+
 	async fn handle_request_headers(
 		&mut self,
 		_headers: &HttpHeaders,
@@ -249,7 +253,15 @@ where
 			let result = async {
 				let mut request_stream = request.into_inner();
 
-				while let Some(request_result) = request_stream.message().await? {
+				loop {
+					let request_result = match request_stream.message().await {
+						Ok(Some(request_result)) => request_result,
+						Ok(None) => break,
+						Err(status) => {
+							handler.on_stream_error(&status).await;
+							return Err(status);
+						},
+					};
 					trace!("Received request: {:?}", request_result.request);
 					handler.on_request(&request_result).await;
 					match request_result.request {

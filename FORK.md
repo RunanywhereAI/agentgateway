@@ -6,7 +6,7 @@ The earlier branch `ra/v1.5.0-client-leave` carries the first change only (the b
 
 ## What it carries
 
-### 1. Cancel the upstream when the client leaves
+### 1. Cancel the upstream, and the ext_proc call, when the client leaves
 
 When an ext_proc policy processes the response body in `FULL_DUPLEX_STREAMED` mode and the downstream
 client disconnects after the response headers were sent, upstream v1.5.0 keeps reading the upstream body
@@ -16,10 +16,20 @@ when the returned body is dropped (through the crate's own `http::DropBody`), ab
 reader (dropping the upstream body, which cancels the upstream request), ends the gRPC request stream to
 the ext_proc server (`take_until` on the token) and stops the response continuation.
 
-Files: `crates/agentgateway/src/http/ext_proc.rs` (the fix),
-`crates/agentgateway/src/http/ext_proc_tests.rs` (the test
-`dropping_the_response_cancels_the_upstream_and_ends_the_ext_proc_stream`) and
-`crates/agentgateway/src/test_helpers/extprocmock.rs` (an `on_eof` hook on the mock handler).
+A client that leaves is told apart from a response that was processed to its end: when the returned body is
+dropped while the processing of it is still running (a sender of the body's channel is alive), a second token
+(`abort`) is cancelled first. It cancels the call to the ext_proc server instead of ending it: the request body of the
+call (`AbortableChannel` in `ext_proc/channel.rs`) fails with an `h2::Error` of reason CANCEL
+(`agent_hbone::cancelled()`), which hyper turns into RST_STREAM(CANCEL), and the task that reads the stream of
+responses stops and drops it. The server sees a cancelled call (for a Go gRPC server, the stream's context is
+cancelled and `Recv` returns an error, not `io.EOF`), where a half-close shows it a clean end. A response processed to
+its end still closes the call cleanly.
+
+Files: `crates/agentgateway/src/http/ext_proc.rs` (the fix), `ext_proc/channel.rs` (the abortable channel),
+`crates/hbone/src/lib.rs` (`cancelled()`, which saves a dependency edit), `crates/agentgateway/src/http/ext_proc_tests.rs`
+(the tests `dropping_the_response_cancels_the_upstream_and_the_ext_proc_call` and
+`a_response_read_to_its_end_closes_the_ext_proc_stream_cleanly`) and
+`crates/agentgateway/src/test_helpers/extprocmock.rs` (`on_eof` and `on_stream_error` hooks on the mock handler).
 
 ### 2. A body field read never materialises a large or non-scalar value
 
@@ -42,11 +52,11 @@ ext_proc server charges for tokens the client never received.
 
 ## Evidence
 
-- With the change, `cargo test --locked -p agentgateway --lib -- http::ext_proc::tests::body_streaming_and_trailers`
-  passes 5 of 5, the new test among them.
-- Without the change (the test alone), the new test fails after its 2-second timeout and the other four pass.
-- The whole library suite with the change: 1994 passed, 0 failed, 1 ignored (`cargo test --locked -p agentgateway --lib`,
-  with every `OTEL_*` variable unset: three upstream config tests read an OTLP endpoint from the environment).
+- The half-close form of this change (`v1.5.0-ra.1`, branch `ra/v1.5.0-client-leave`): the body-streaming tests passed
+  5 of 5, its test failed without the change, and the whole library suite passed (1994 passed, 0 failed, 1 ignored, with
+  every `OTEL_*` variable unset: three upstream config tests read an OTLP endpoint from the environment).
+- The cancelling form, with the tests above, has not been compiled or run when this is written; its evidence is the
+  Cloud Build run of the consumer's ad-hoc test build.
 
 ## Upstream
 
