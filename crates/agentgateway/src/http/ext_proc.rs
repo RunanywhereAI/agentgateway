@@ -26,7 +26,9 @@ use crate::proxy::ProxyError;
 use crate::proxy::dtrace::{self, pol_result};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::metrics::{OutboundCallKind, OutboundCallSubtype};
-use crate::types::agent::{SimpleBackendReference, SimpleBackendReferenceWithPolicies};
+use crate::types::agent::{
+	BackendTrafficPolicy, SimpleBackendReference, SimpleBackendReferenceWithPolicies,
+};
 use crate::{http, *};
 
 /// The namespace key used for ext_proc attributes in ProcessingRequest.attributes
@@ -197,6 +199,19 @@ pub struct InferenceRequestResult {
 	pub failed_open: bool,
 }
 
+/// How long the call to the endpoint picker may take to answer with its response headers.
+///
+/// A picker holds a request in its queue until its class deadline and answers, with its first message (a gRPC
+/// server sends the response headers with it), either the endpoint or its own refusal with a Retry-After: the
+/// platform's per-class deadlines are 10 s by default and at most 20 s (ADR 0041, the picker's
+/// `defaultRequestTTL` and `noEndpointRequestTTL`). v1.6.0 gives every policy call with no timeout of its own a
+/// 10 s fallback (`internal_call_with_policies`), which cut the call at 10 s and answered the client a 500 where
+/// the picker would have refused it with its 429 or 503; v1.5.0 had no fallback. No AgentgatewayPolicy can set
+/// the timeout of this call (a Service policy attaches only to a route's backend, and the picker is not one), so
+/// the call carries its own. 30 s is the longest deadline plus a margin: if a deadline is ever raised past 20 s,
+/// raise this with it.
+pub const PICKER_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl InferenceRouting {
 	pub fn build(&self, client: PolicyClient) -> InferencePoolRouter {
 		InferencePoolRouter {
@@ -205,7 +220,10 @@ impl InferenceRouting {
 				client,
 				SimpleBackendReferenceWithPolicies {
 					target: self.target.clone(),
-					policies: Vec::new(),
+					policies: vec![BackendTrafficPolicy::HTTP(crate::types::backend::HTTP {
+						request_timeout: Some(PICKER_CALL_TIMEOUT),
+						..Default::default()
+					})],
 				},
 				self.failure_mode,
 				None,

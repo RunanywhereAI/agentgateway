@@ -789,7 +789,23 @@ impl HTTPProxy {
 			.apply(&mut resp, log.as_mut().unwrap(), is_upstream_response)
 			.await
 		{
-			(resp, reason) = resolve_response(Err(failure), log.as_mut().unwrap(), is_grpc_request);
+			// A response policy that replaces an answer the upstream already sent (an external processor's
+			// ImmediateResponse in the response phase, the stream meter's answer to an engine's 5xx) leaves it
+			// the upstream's answer: the reason stays `Upstream`, as v1.5.0 labelled it (it never changed the
+			// reason after the response policies) and as the pool release controller counts it
+			// (`reason="Upstream"` is an engine's own answer). v1.6.0 resets it to the failure's. An error the
+			// proxy made itself (a processor that failed, a transformation that errored) keeps its own reason,
+			// and so does any failure of the request phase, which never reaches this point as an upstream answer.
+			let replaces_an_upstream_answer =
+				is_upstream_response && matches!(failure, ProxyResponse::DirectResponse(_));
+			let failed_reason;
+			(resp, failed_reason) =
+				resolve_response(Err(failure), log.as_mut().unwrap(), is_grpc_request);
+			reason = if replaces_an_upstream_answer {
+				ProxyResponseReason::Upstream
+			} else {
+				failed_reason
+			};
 		}
 		// An error the proxy made itself is written again for the request's dialect, now that the response
 		// policies have put the request id on it.

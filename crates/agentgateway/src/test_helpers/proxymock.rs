@@ -421,6 +421,8 @@ pub async fn tls_mock() -> (MockServer, MockTlsCertificates) {
 
 pub struct TestBind {
 	pub pi: Arc<ProxyInputs>,
+	// The registry `pi.metrics` is registered in, kept so a test can read what the proxy counted.
+	registry: Registry,
 	drain_rx: DrainWatcher,
 	_drain_tx: DrainTrigger,
 
@@ -480,6 +482,14 @@ impl tower::Service<Uri> for MemoryConnector {
 }
 
 impl TestBind {
+	/// What the proxy has counted so far, in the text form its metrics endpoint serves.
+	pub fn metrics_text(&self) -> String {
+		let mut encoded = String::new();
+		prometheus_client::encoding::text::encode(&mut encoded, &self.registry)
+			.expect("the metrics encode");
+		encoded
+	}
+
 	pub fn with_bind(self, snapshot: BindSnapshot) -> Self {
 		let mut binds = self.pi.stores.binds.write();
 		let bind_key = snapshot.key.clone();
@@ -1494,11 +1504,12 @@ pub fn setup_proxy_test_with_config_and_spiffe(
 	let stores = Stores::new(config.ipv6_enabled, config.threading_mode);
 	let client = client::Client::new(&config.dns, None, Default::default(), None);
 	let (drain_tx, drain_rx) = drain::new();
+	let mut registry = Registry::default();
 	let pi = Arc::new(ProxyInputs {
 		cfg: Arc::new(config),
 		stores: stores.clone(),
 		metrics: Arc::new(crate::metrics::Metrics::new(
-			metrics::sub_registry(&mut Registry::default()),
+			metrics::sub_registry(&mut registry),
 			Default::default(),
 			histogram_mode,
 		)),
@@ -1513,6 +1524,7 @@ pub fn setup_proxy_test_with_config_and_spiffe(
 	});
 	TestBind {
 		pi,
+		registry,
 		drain_rx,
 		_drain_tx: drain_tx,
 

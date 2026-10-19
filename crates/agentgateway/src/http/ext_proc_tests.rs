@@ -2815,7 +2815,14 @@ async fn setup_inference_routing_mock(
 		ExtProcMock::new(move || StandaloneInferenceRouter::new(target, request_headers_seen.clone()))
 			.spawn()
 			.await;
+	setup_inference_routing_with(ext_proc, destination_mode).await
+}
 
+/// The proxy with an inference routing policy whose endpoint picker is `ext_proc`.
+async fn setup_inference_routing_with(
+	ext_proc: MockInstance,
+	destination_mode: Option<&'static str>,
+) -> (MockInstance, TestBind, Client<MemoryConnector, Body>) {
 	let mut t = setup_proxy_test("{}").unwrap().with_bind(simple_bind());
 	configure_standalone_service(&t);
 	let mut inference_routing = json!({
@@ -6873,5 +6880,222 @@ mod metadata_context_and_attributes {
 			Some(prost_wkt_types::value::Kind::NumberValue(n)) => assert_eq!(*n, 200.0),
 			invalid => panic!("exepected a number got {:?}", invalid),
 		}
+	}
+}
+
+// The call to the endpoint picker. A picker holds a request in its queue until its class deadline (10 s by default,
+// 20 s at most: ADR 0041) and sends the response headers of its gRPC call with its first message, so the call is "silent"
+// for as long as the request is queued. v1.6.0 cuts a policy call with no timeout of its own at 10 s
+// (`internal_call_with_policies`), which answered the client a 500 where the picker would have refused it.
+mod picker_call {
+	use super::*;
+
+	/// The picker as the platform's is: the response headers of its call, and so its answer, come `delay`
+	/// after the call opened. (The mock's own `process` returns at once, which sends the headers at once and
+	/// is why the processors that only delay their answers were never cut.)
+	struct HoldsTheCallOpen {
+		delay: Duration,
+		router: StandaloneInferenceRouter,
+	}
+
+	#[async_trait::async_trait]
+	impl Handler for HoldsTheCallOpen {
+		async fn on_open(&mut self, _metadata: &tonic::metadata::MetadataMap) {
+			tokio::time::sleep(self.delay).await;
+		}
+
+		async fn handle_request_headers(
+			&mut self,
+			headers: &HttpHeaders,
+			sender: &Sender<Result<ProcessingResponse, Status>>,
+		) -> Result<(), Status> {
+			self.router.handle_request_headers(headers, sender).await
+		}
+	}
+
+	async fn picker_that_answers_after(
+		delay: Duration,
+		backend: SocketAddr,
+		request_headers_seen: Arc<AtomicUsize>,
+	) -> (MockInstance, TestBind, Client<MemoryConnector, Body>) {
+		let ext_proc = ExtProcMock::new(move || HoldsTheCallOpen {
+			delay,
+			router: StandaloneInferenceRouter::new(Some(backend), request_headers_seen.clone()),
+		})
+		.spawn()
+		.await;
+		setup_inference_routing_with(ext_proc, Some("passthrough")).await
+	}
+
+	// A queued request: the picker answers after 12 s, longer than v1.6.0's 10 s fallback, and the request goes to
+	// the endpoint it chose.
+	#[tokio::test]
+	async fn a_picker_that_answers_after_twelve_seconds_is_not_cut_and_its_choice_is_used() {
+		let backend = named_backend("backend-b").await;
+		let seen = Arc::new(AtomicUsize::new(0));
+		let delay = Duration::from_secs(12);
+		let (_ext_proc, _bind, io) =
+			picker_that_answers_after(delay, *backend.address(), seen.clone()).await;
+
+		let started = std::time::Instant::now();
+		let res = tokio::time::timeout(
+			Duration::from_secs(60),
+			send_request(io, Method::GET, "http://lo"),
+		)
+		.await
+		.expect("the request must be answered");
+		assert!(
+			started.elapsed() >= delay,
+			"answered after {:?}: the picker did not hold the call as long as the test says",
+			started.elapsed()
+		);
+		assert_eq!(res.status(), 200, "the picker's answer must not be cut");
+		let body = read_body_raw(res.into_body()).await;
+		assert_eq!(body.as_ref(), b"backend-b");
+		assert_eq!(seen.load(Ordering::SeqCst), 1);
+	}
+
+	// The bound is real: a picker that is silent beyond 30 s is cut, and the request fails closed. The 30 s
+	// is written out here and not read from the code, so a test of the bound cannot follow a change of it.
+	#[tokio::test]
+	async fn a_picker_silent_beyond_thirty_seconds_is_cut_and_the_request_fails_closed() {
+		let backend = named_backend("backend-b").await;
+		let seen = Arc::new(AtomicUsize::new(0));
+		let bound = Duration::from_secs(30);
+		let delay = bound + Duration::from_secs(5);
+		let (_ext_proc, _bind, io) =
+			picker_that_answers_after(delay, *backend.address(), seen.clone()).await;
+
+		let started = std::time::Instant::now();
+		let res = tokio::time::timeout(
+			Duration::from_secs(90),
+			send_request(io, Method::GET, "http://lo"),
+		)
+		.await
+		.expect("the request must be answered");
+		let waited = started.elapsed();
+		assert_eq!(
+			res.status(),
+			500,
+			"a picker that never answers fails the request closed"
+		);
+		assert!(
+			waited >= bound && waited < delay,
+			"cut after {waited:?}: it must be cut at the bound ({bound:?}), before the picker would have answered ({delay:?})"
+		);
+		assert_eq!(
+			seen.load(Ordering::SeqCst),
+			0,
+			"the picker never saw the request"
+		);
+		assert_eq!(
+			backend.received_requests().await.expect("recorded").len(),
+			0
+		);
+	}
+}
+
+// The reason label of an answer: `requests_total{reason}` says who made the answer. An engine's own answer is
+// `Upstream`, and the pool release controller counts a pool's responses with `reason="Upstream"`. The stream meter
+// replaces an engine's 5xx with its own ImmediateResponse in the response phase; v1.5.0 left the reason as it was,
+// v1.6.0 reset it to `DirectResponse`, and a pool whose engines answer 5xx dropped out of the count.
+mod reason_of_a_replaced_answer {
+	use super::*;
+
+	async fn engine_that_answers_500() -> MockServer {
+		let mock = MockServer::start().await;
+		Mock::given(wiremock::matchers::path_regex("/.*"))
+			.respond_with(ResponseTemplate::new(500).set_body_string("engine failure"))
+			.mount(&mock)
+			.await;
+		mock
+	}
+
+	/// The `requests_total` line the proxy counted for a request that ended in `status`.
+	async fn counted_with_status(bind: &TestBind, status: u16) -> String {
+		let wanted = format!("status=\"{status}\"");
+		for _ in 0..100 {
+			let text = bind.metrics_text();
+			if let Some(line) = text
+				.lines()
+				.find(|line| line.starts_with("agentgateway_requests_total{") && line.contains(&wanted))
+			{
+				return line.to_string();
+			}
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+		panic!(
+			"no requests_total line with {wanted}: {}",
+			bind.metrics_text()
+		);
+	}
+
+	// The case that failed: an engine's 500 that a response-phase ImmediateResponse replaces with a 202.
+	#[tokio::test]
+	async fn an_upstream_answer_replaced_in_the_response_phase_keeps_the_upstream_reason() {
+		let engine = engine_that_answers_500().await;
+		let (_mock, _ext_proc, bind, io) = setup_ext_proc_mock(
+			engine,
+			ext_proc::FailureMode::FailClosed,
+			ExtProcMock::new(ImmediateResponseExtProcResponse::default),
+			"{}",
+		)
+		.await;
+		let res = send_request_body(io, Method::POST, "http://lo", b"request").await;
+		assert_eq!(res.status(), 202);
+		let body = read_body_raw(res.into_body()).await;
+		assert_eq!(body.as_ref(), b"immediate");
+		let line = counted_with_status(&bind, 202).await;
+		assert!(line.contains("reason=\"Upstream\""), "{line}");
+	}
+
+	// An ImmediateResponse of the request phase is the processor's own answer; no upstream was asked.
+	#[tokio::test]
+	async fn an_immediate_response_in_the_request_phase_keeps_the_direct_response_reason() {
+		let engine = engine_that_answers_500().await;
+		let (engine, _ext_proc, bind, io) = setup_ext_proc_mock(
+			engine,
+			ext_proc::FailureMode::FailClosed,
+			ExtProcMock::new(ImmediateResponseExtProc::default),
+			"{}",
+		)
+		.await;
+		let res = send_request_body(io, Method::POST, "http://lo", b"request").await;
+		assert_eq!(res.status(), 202);
+		let line = counted_with_status(&bind, 202).await;
+		assert!(line.contains("reason=\"DirectResponse\""), "{line}");
+		assert_eq!(engine.received_requests().await.expect("recorded").len(), 0);
+	}
+
+	/// Answers the request headers and fails the call when the response headers arrive.
+	#[derive(Debug, Default)]
+	struct FailsInTheResponsePhase;
+
+	#[async_trait::async_trait]
+	impl Handler for FailsInTheResponsePhase {
+		async fn handle_response_headers(
+			&mut self,
+			_: &HttpHeaders,
+			_: &Sender<Result<ProcessingResponse, Status>>,
+		) -> Result<(), Status> {
+			Err(Status::failed_precondition("injected response phase error"))
+		}
+	}
+
+	// A processor that fails is the proxy's own error, not the engine's answer, even in the response phase.
+	#[tokio::test]
+	async fn a_processor_that_fails_in_the_response_phase_keeps_the_ext_proc_reason() {
+		let engine = engine_that_answers_500().await;
+		let (_mock, _ext_proc, bind, io) = setup_ext_proc_mock(
+			engine,
+			ext_proc::FailureMode::FailClosed,
+			ExtProcMock::new(FailsInTheResponsePhase::default),
+			"{}",
+		)
+		.await;
+		let res = send_request_body(io, Method::POST, "http://lo", b"request").await;
+		assert_eq!(res.status(), 500);
+		let line = counted_with_status(&bind, 500).await;
+		assert!(line.contains("reason=\"ExtProc\""), "{line}");
 	}
 }
