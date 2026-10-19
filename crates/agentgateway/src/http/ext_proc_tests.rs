@@ -5738,6 +5738,98 @@ mod body_streaming_and_trailers {
 		drop(peer);
 	}
 
+	/// The mock's own defaults: every body chunk comes straight back as the processed chunk.
+	struct EchoBodies;
+
+	#[async_trait::async_trait]
+	impl Handler for EchoBodies {}
+
+	/// Drops every packet the proxy sends to `port` on this machine, which is what a peer that
+	/// vanished without a FIN looks like from here: the connection stays open, nothing is
+	/// acknowledged, nothing comes back. It needs root and `iptables`.
+	struct BlackHole {
+		port: u16,
+	}
+
+	impl BlackHole {
+		fn open(port: u16) -> Self {
+			Self::rule("-I", port);
+			Self { port }
+		}
+
+		fn rule(action: &str, port: u16) {
+			let status = std::process::Command::new("iptables")
+				.args([action, "OUTPUT", "-p", "tcp", "--dport", &port.to_string(), "-j", "DROP"])
+				.status()
+				.expect("iptables must be installed");
+			assert!(status.success(), "iptables {action} failed: {status}");
+		}
+	}
+
+	impl Drop for BlackHole {
+		fn drop(&mut self) {
+			Self::rule("-D", self.port);
+		}
+	}
+
+	// EVIDENCE ONLY (not part of the patch): a processor that goes silent mid-stream, with its FIN
+	// never arriving, on a real dropped-packets connection. The call is answered first, so the stream
+	// is in flight, and the response must end within the dead-peer bound (14 s by default).
+	#[tokio::test]
+	#[ignore = "needs root and iptables (run with --ignored in a container with NET_ADMIN)"]
+	async fn evidence_a_blackholed_processor_ends_the_response_within_the_default_bound() {
+		let ext_proc = ExtProcMock::new(|| EchoBodies).spawn().await;
+		let mut ext_proc_request = build_ext_proc_request_for_test(
+			ext_proc.address,
+			ext_proc::ProcessingOptions {
+				response_body_mode: ext_proc::BodySendMode::FullDuplexStreamed,
+				..Default::default()
+			},
+		);
+		let (upstream, upstream_frames) = mpsc::channel::<Result<Frame<bytes::Bytes>, Infallible>>(1);
+		let mut resp = http::Response::new(Body::new(http_body_util::StreamBody::new(
+			tokio_stream::wrappers::ReceiverStream::new(upstream_frames),
+		)));
+		let _ = ext_proc_request
+			.mutate_response(&mut resp, None)
+			.await
+			.unwrap();
+		let mut body = resp.into_body();
+		upstream
+			.send(Ok(Frame::data(bytes::Bytes::from_static(b"first"))))
+			.await
+			.unwrap();
+		let first = tokio::time::timeout(Duration::from_secs(10), http_body_util::BodyExt::frame(&mut body))
+			.await
+			.expect("the first chunk must come back through the processor")
+			.expect("the body has a first frame")
+			.expect("the first frame is not an error");
+		assert_eq!(first.into_data().ok().as_deref(), Some(&b"first"[..]));
+		let _hole = BlackHole::open(ext_proc.address.port());
+		let feeding = tokio::spawn(async move {
+			let chunk = bytes::Bytes::from(vec![b'x'; 8 * 1024]);
+			while upstream.send(Ok(Frame::data(chunk.clone()))).await.is_ok() {
+				tokio::time::sleep(Duration::from_millis(100)).await;
+			}
+		});
+		let started = std::time::Instant::now();
+		let ended = tokio::time::timeout(Duration::from_secs(120), async {
+			loop {
+				match http_body_util::BodyExt::frame(&mut body).await {
+					None | Some(Err(_)) => break,
+					Some(Ok(_)) => {},
+				}
+			}
+		})
+		.await;
+		let took = started.elapsed();
+		eprintln!("EVIDENCE blackholed processor: response ended={} after {took:?}", ended.is_ok());
+		feeding.abort();
+		assert!(ended.is_ok(), "the response was still open after {took:?}");
+		assert!(took < Duration::from_secs(40), "it ended after {took:?}");
+		drop(ext_proc_request);
+	}
+
 	// The counterpart: a response that was processed to its end is not a client that left. Its call
 	// finishes cleanly, as it does without the cancellation, and the server sees no failure.
 	#[tokio::test]
