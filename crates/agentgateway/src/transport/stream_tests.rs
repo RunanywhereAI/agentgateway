@@ -151,7 +151,10 @@ mod user_timeout {
 			.unwrap();
 		// More than twice the time the bound takes (2 seconds).
 		let error = write_until_it_fails(&mut socket, seconds(5)).await;
-		assert!(error.is_none(), "the connection ended without a bound: {error:?}");
+		assert!(
+			error.is_none(),
+			"the connection ended without a bound: {error:?}"
+		);
 	}
 
 	#[tokio::test]

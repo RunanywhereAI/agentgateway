@@ -5832,7 +5832,12 @@ mod body_streaming_and_trailers {
 			// and the socket is skipped.
 			let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
 			let socket = socket2::SockRef::from(&borrowed);
-			if socket.peer_addr().ok().and_then(|address| address.as_socket()) == Some(peer) {
+			if socket
+				.peer_addr()
+				.ok()
+				.and_then(|address| address.as_socket())
+				== Some(peer)
+			{
 				found.push(socket.tcp_user_timeout().unwrap_or(None));
 			}
 		}
@@ -5857,8 +5862,7 @@ mod body_streaming_and_trailers {
 			(with_policy.address, two_second_bound()),
 		] {
 			let mut ext_proc_request = build_ext_proc_request_with_policies(peer, options(), policies);
-			let (upstream, upstream_frames) =
-				mpsc::channel::<Result<Frame<bytes::Bytes>, Infallible>>(1);
+			let (upstream, upstream_frames) = mpsc::channel::<Result<Frame<bytes::Bytes>, Infallible>>(1);
 			let mut resp = http::Response::new(Body::new(http_body_util::StreamBody::new(
 				tokio_stream::wrappers::ReceiverStream::new(upstream_frames),
 			)));
