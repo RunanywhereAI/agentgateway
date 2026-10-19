@@ -1344,11 +1344,14 @@ async fn llm_custom_provider_rejects_unsupported_format_before_upstream_call() {
 	let res = send_completions_with_model(io, "replaceme", &[]).await;
 	assert_eq!(res.status(), 400);
 	let body = read_body_raw(res.into_body()).await;
-	assert!(
-		String::from_utf8_lossy(&body)
-			.contains("unsupported conversion: from Completions to provider custom"),
-		"unexpected response body: {}",
-		String::from_utf8_lossy(&body)
+	// The proxy's own error is the public error envelope with the fixed sentence of a 400, not the error's text
+	// ("unsupported conversion: from Completions to provider custom"), which names the provider.
+	let envelope: serde_json::Value =
+		serde_json::from_slice(&body).expect("the 400 body is the JSON envelope");
+	assert_eq!(envelope["error"]["code"], "bad_request", "{envelope}");
+	assert_eq!(
+		envelope["error"]["message"], "The request is invalid.",
+		"{envelope}"
 	);
 
 	let requests = mock
