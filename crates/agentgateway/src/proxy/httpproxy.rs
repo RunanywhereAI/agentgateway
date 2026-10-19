@@ -3423,6 +3423,10 @@ const PICKED_DESTINATION_WAIT: std::time::Duration = std::time::Duration::from_s
 /// when the wait ends, so an insert that lands at the deadline counts. `inserts` must be subscribed
 /// before the first run, so an insert between a run and the wait still wakes it. Any other result,
 /// and the last failure, are returned unchanged.
+///
+/// The deadline is checked after every run, not only by the timer: the timer is polled after the
+/// receiver, so while inserts of other workloads keep arriving the receiver is ready every time and
+/// the timer would not get its turn until the runtime's cooperative budget ran out.
 async fn until_discovered<T>(
 	mut inserts: tokio::sync::watch::Receiver<()>,
 	limit: std::time::Duration,
@@ -3433,6 +3437,10 @@ async fn until_discovered<T>(
 		match attempt() {
 			Err(ProxyError::NoHealthyEndpoints) => {},
 			done => return done,
+		}
+		// This run was the last one when the deadline has passed: its failure is the answer.
+		if tokio::time::Instant::now() >= deadline {
+			return Err(ProxyError::NoHealthyEndpoints);
 		}
 		match tokio::time::timeout_at(deadline, inserts.changed()).await {
 			Ok(Ok(())) => {},
@@ -4186,6 +4194,41 @@ mod picked_destination_wait_tests {
 		);
 		assert_eq!(destination.reads(), 2);
 		assert_eq!(started.elapsed(), Duration::ZERO);
+	}
+
+	/// Inserts of other workloads that never stop must not hold the wait past its limit: every run
+	/// here makes the next insert ready at once, and takes 5 ms of real time, so the receiver is
+	/// always ready and the limit (40 ms) can only be kept by checking the clock after a run.
+	#[tokio::test]
+	async fn inserts_that_never_stop_do_not_extend_the_wait_past_the_limit() {
+		let (inserts, rx) = watch::channel(());
+		let destination = Destination::new(false);
+		let limit = Duration::from_millis(40);
+		let started = Instant::now();
+
+		let result = until_discovered(rx, limit, || {
+			std::thread::sleep(Duration::from_millis(5));
+			let _ = inserts.send(());
+			destination.read()
+		})
+		.await;
+
+		assert!(
+			matches!(result, Err(ProxyError::NoHealthyEndpoints)),
+			"{result:?}"
+		);
+		// About eight runs fit in the limit; without the clock check the loop runs until the
+		// runtime's cooperative budget (128 polls) is spent.
+		assert!(
+			(2..=30).contains(&destination.reads()),
+			"{} runs",
+			destination.reads()
+		);
+		assert!(
+			started.elapsed() < Duration::from_millis(400),
+			"{:?}",
+			started.elapsed()
+		);
 	}
 
 	#[tokio::test(start_paused = true)]
