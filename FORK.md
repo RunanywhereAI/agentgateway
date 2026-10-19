@@ -1,7 +1,7 @@
 # RunanywhereAI fork of agentgateway
 
 This branch, `ra/v1.5.0-ra.3`, is upstream tag `v1.5.0`
-(commit fe6732474a96a0363dfb9822859af4e9bab360fa) plus three changes and their tests. Nothing else differs.
+(commit fe6732474a96a0363dfb9822859af4e9bab360fa) plus four changes and their tests. Nothing else differs.
 The branch `ra/v1.5.0-ra.2` carries the first two (the build `v1.5.0-ra.2`), and `ra/v1.5.0-client-leave` the first
 only (the build `v1.5.0-ra.1`).
 
@@ -85,6 +85,17 @@ route's 501: the consumer's edge uses none of them.
 Files: `crates/agentgateway/src/proxy/public_error.rs` (new, with `public_error_tests.rs`), `proxy/mod.rs`,
 `proxy/httpproxy.rs`, `proxy/gateway.rs`, `http/ext_proc/mutation.rs`, `http/ext_authz.rs`, and the tests that asserted the old
 text (`http/ext_proc_tests.rs`, `tests/tests/policy.rs`, `auth.rs`, `dfp.rs`).
+
+### 4. A request waits for the pod the endpoint picker chose
+
+The endpoint picker follows the cluster's pods directly and the proxy's endpoint set follows them through the controller, so the
+picker can name a pod the proxy has not been told about yet, and the call failed with "no healthy backends" for a pod that was Ready
+and serving. `build_service_call_for_picked_destination` (`proxy/httpproxy.rs`) repeats the endpoint lookup until the workload store
+inserts the pod, for at most two seconds (`PICKED_DESTINATION_WAIT`), with one last run at the deadline; the picker is not asked
+again and a destination still unknown fails exactly as before. Only a destination the picker chose for a Service backend (not a
+passthrough one) waits. Tests: `proxy::httpproxy::picked_destination_wait_tests::*` and
+`http::ext_proc::tests::standalone_inference_routing::standalone_inference_routing_waits_for_the_selected_destination_to_join_the_service`.
+(Commit `fe6e7bad`, by the consumer's picker-readiness work.)
 
 ## Why
 
