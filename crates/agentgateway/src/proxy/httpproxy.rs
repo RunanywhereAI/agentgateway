@@ -3876,6 +3876,12 @@ mod picked_destination_wait_tests {
 		let started = Instant::now();
 
 		let result = until_discovered(rx, limit, || {
+			// Without the clock check this loop never ends (measured: the receiver is ready on
+			// every poll), so the run that proves the wait is not ending is the one that fails.
+			assert!(
+				destination.reads() < 100,
+				"the wait is still running after 100 runs"
+			);
 			std::thread::sleep(Duration::from_millis(5));
 			let _ = inserts.send(());
 			destination.read()
