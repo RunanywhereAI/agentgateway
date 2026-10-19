@@ -329,8 +329,9 @@ async fn an_authorization_service_that_is_unavailable_without_a_body_is_a_503_cr
 #[tokio::test]
 async fn an_unavailable_answer_without_a_body_is_not_cached() {
 	// A transient fault must not become a cached refusal: with a cache on, the first check is UNAVAILABLE and
-	// the second is asked again and allowed.
-	struct UnavailableOnce(bool);
+	// the second is asked again and allowed. The mock builds a fresh handler for every call, so the "already
+	// answered once" state is shared between them.
+	struct UnavailableOnce(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 	#[async_trait::async_trait]
 	impl extauthmock::Handler for UnavailableOnce {
@@ -338,7 +339,7 @@ async fn an_unavailable_answer_without_a_body_is_not_cached() {
 			&mut self,
 			_request: &agentgateway::http::ext_authz::proto::CheckRequest,
 		) -> Result<agentgateway::http::ext_authz::proto::CheckResponse, tonic::Status> {
-			if std::mem::replace(&mut self.0, true) {
+			if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
 				extauthmock::allow_response(None)
 			} else {
 				Ok(bare_status(14))
@@ -347,7 +348,8 @@ async fn an_unavailable_answer_without_a_body_is_not_cached() {
 	}
 
 	let (_mock, mut bind, io) = basic_setup().await;
-	let authz = extauthmock::ExtAuthMock::new(|| UnavailableOnce(false))
+	let answered_once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let authz = extauthmock::ExtAuthMock::new(move || UnavailableOnce(answered_once.clone()))
 		.spawn()
 		.await;
 	bind
