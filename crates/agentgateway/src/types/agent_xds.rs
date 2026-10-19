@@ -3664,7 +3664,11 @@ impl From<&proto::agent::KeepaliveConfig> for KeepaliveConfig {
 			retries: k
 				.retries
 				.unwrap_or_else(types::agent::defaults::keepalive_retries),
+			user_timeout: None,
 		}
+		// A keepalive a policy asks for also bounds how long sent data may stay unacknowledged, to the
+		// time the probes take to declare an idle peer dead.
+		.with_dead_peer_bound()
 	}
 }
 

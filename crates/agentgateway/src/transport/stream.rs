@@ -21,6 +21,7 @@ use tracing::event;
 use crate::telemetry::metrics::{Metrics as TelemetryMetrics, TCPLabels};
 use crate::transport::rewind;
 use crate::transport::rewind::RewindSocket;
+use crate::types::agent::KeepaliveConfig;
 use crate::types::frontend::TCP;
 
 #[derive(Debug, Clone)]
@@ -335,12 +336,10 @@ impl Socket {
 			.await
 			.map_err(|to| io::Error::new(io::ErrorKind::TimedOut, to))??;
 		if cfg.keepalives.enabled {
-			let ka = socket2::TcpKeepalive::new()
-				.with_time(cfg.keepalives.time)
-				.with_retries(cfg.keepalives.retries)
-				.with_interval(cfg.keepalives.interval);
-			let res = socket2::SockRef::from(&res).set_tcp_keepalive(&ka);
-			tracing::trace!("set keepalive: {:?}", res);
+			// A user timeout the config asks for that cannot be set fails the connection: a connection that
+			// silently lacks its bound would hang on a silent peer, where a refused one is retried or fails
+			// closed.
+			set_keepalive(socket2::SockRef::from(&res), &cfg.keepalives)?;
 		}
 		Socket::from_tcp(res)
 	}
@@ -379,16 +378,36 @@ impl Socket {
 		if let SocketType::Tcp(tcp) = &self.inner
 			&& let Some(keepalives) = &settings.keepalives
 			&& keepalives.enabled
+			&& let Err(error) = set_keepalive(socket2::SockRef::from(tcp), keepalives)
 		{
-			let ka = socket2::TcpKeepalive::new()
-				.with_time(keepalives.time)
-				.with_retries(keepalives.retries)
-				.with_interval(keepalives.interval);
-			let res = socket2::SockRef::from(tcp).set_tcp_keepalive(&ka);
-			tracing::trace!("set keepalive: {:?}", res);
+			tracing::warn!("failed to set the TCP user timeout: {error}");
 		}
 	}
 }
+
+/// Turns TCP keepalive on for a connected socket and, when the config bounds it, sets the user
+/// timeout (`TCP_USER_TIMEOUT`, Linux only): how long sent data may stay unacknowledged before the
+/// kernel drops the connection. The keepalive probes alone do not end a connection that has data in
+/// flight to a peer that went silent, because the kernel sends no probe while data is unacknowledged;
+/// with the user timeout set, the retransmissions of that data end it too. The keepalive itself stays
+/// best effort, as before; only the user timeout is an error.
+fn set_keepalive(socket: socket2::SockRef<'_>, keepalives: &KeepaliveConfig) -> io::Result<()> {
+	let probes = socket2::TcpKeepalive::new()
+		.with_time(keepalives.time)
+		.with_retries(keepalives.retries)
+		.with_interval(keepalives.interval);
+	let res = socket.set_tcp_keepalive(&probes);
+	tracing::trace!("set keepalive: {:?}", res);
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	if let Some(user_timeout) = keepalives.user_timeout {
+		socket.set_tcp_user_timeout(Some(user_timeout))?;
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+#[path = "stream_tests.rs"]
+mod tests;
 
 pub enum SocketType {
 	Tcp(TcpStream),

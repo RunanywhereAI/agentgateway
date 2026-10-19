@@ -69,9 +69,11 @@ impl tower::Service<::http::Request<tonic::body::Body>> for AbortableChannel {
 		let policies = self.inner.policies.clone();
 		let abort = self.abort.clone();
 		let req = req.map(|body| http::Body::new(CancelOnAbort::new(http::Body::new(body), abort)));
+		// The call of the stream to an external processor: a processor that falls silent without its
+		// connection closing must end the stream in seconds (see `with_dead_peer_keepalive`).
 		Box::pin(async move {
 			client
-				.call_reference_with_policies_untraced(req, &target, policies.as_slice())
+				.call_ext_proc_with_policies_untraced(req, &target, policies.as_slice())
 				.await
 		})
 	}

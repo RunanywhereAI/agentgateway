@@ -1932,6 +1932,15 @@ fn get_backend_policies(
 	)
 }
 
+/// Gives the policies of a call to an external processor the dead-peer keepalive when none of them
+/// sets a keepalive. A keepalive any policy sets (on the processor's Service, or inline) is kept.
+pub(crate) fn with_dead_peer_keepalive(pols: &mut BackendPolicies) {
+	let tcp = pols.tcp.get_or_insert_with(Default::default);
+	if tcp.keepalives.is_none() {
+		tcp.keepalives = Some(crate::types::agent::KeepaliveConfig::dead_peer());
+	}
+}
+
 pub struct MustSnapshot<'a>(&'a mut Option<Request>);
 
 impl<'a> MustSnapshot<'a> {
@@ -5145,6 +5154,25 @@ impl PolicyClient {
 	) -> Result<Response, ProxyError> {
 		let start = std::time::Instant::now();
 		let (backend, pols) = self.prepare_reference_call(&mut req, backend_ref, policies)?;
+		let res = self.internal_call_with_policies(req, backend, pols).await;
+		self.observe_outbound(start);
+		res
+	}
+
+	/// The call of an external processor's stream (the stream meter, an endpoint picker): the same call
+	/// as `call_reference_with_policies_untraced`, except that a processor with no keepalive policy is
+	/// given `KeepaliveConfig::dead_peer`, so a processor that falls silent without its connection
+	/// closing (a pod that vanished, a node that was lost) ends the stream in seconds, where the
+	/// kernel's own give-up time is about 15 minutes.
+	pub(crate) async fn call_ext_proc_with_policies_untraced(
+		&self,
+		mut req: Request,
+		backend_ref: &SimpleBackendReference,
+		policies: &[BackendTrafficPolicy],
+	) -> Result<Response, ProxyError> {
+		let start = std::time::Instant::now();
+		let (backend, mut pols) = self.prepare_reference_call(&mut req, backend_ref, policies)?;
+		with_dead_peer_keepalive(&mut pols);
 		let res = self.internal_call_with_policies(req, backend, pols).await;
 		self.observe_outbound(start);
 		res

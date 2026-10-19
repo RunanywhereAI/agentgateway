@@ -3213,6 +3213,20 @@ pub struct KeepaliveConfig {
 	/// Number of unacknowledged probes before the connection is considered dead.
 	#[serde(default = "defaults::keepalive_retries")]
 	pub retries: u32,
+	/// How long data this side has sent may stay unacknowledged before the kernel drops the
+	/// connection (`TCP_USER_TIMEOUT`, Linux only; ignored elsewhere). Unset leaves the kernel's own
+	/// give-up time, about 15 minutes. The kernel sends no keepalive probe while data is
+	/// unacknowledged, so without it a stream that is still being written to a peer that has gone
+	/// silent (no FIN or RST ever arrived) is not ended by the probes above. A keepalive set by a
+	/// policy, or by `KeepaliveConfig::dead_peer`, sets it to `time + interval * retries`, the time the
+	/// probes themselves take to declare an idle peer dead.
+	#[serde(
+		default,
+		skip_serializing_if = "Option::is_none",
+		with = "crate::serdes::serde_dur_option"
+	)]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+	pub user_timeout: Option<Duration>,
 }
 
 impl Default for KeepaliveConfig {
@@ -3222,7 +3236,39 @@ impl Default for KeepaliveConfig {
 			time: defaults::keepalive_time(),
 			interval: defaults::keepalive_interval(),
 			retries: defaults::keepalive_retries(),
+			user_timeout: None,
 		}
+	}
+}
+
+impl KeepaliveConfig {
+	/// How long the probes take to declare an idle peer dead: `time + interval * retries`.
+	pub fn give_up_after(&self) -> Duration {
+		self
+			.time
+			.saturating_add(self.interval.saturating_mul(self.retries))
+	}
+
+	/// This keepalive, with the user timeout set to what the probes take to declare an idle peer
+	/// dead, so that a peer that went silent ends the connection in that time whether the connection
+	/// is idle or has data in flight.
+	pub fn with_dead_peer_bound(mut self) -> Self {
+		self.user_timeout = Some(self.give_up_after());
+		self
+	}
+
+	/// The keepalive of a call to a peer that must answer promptly or be given up on (an external
+	/// processor: the stream meter, the endpoint picker): the first probe after 5 seconds of silence, then
+	/// every 3 seconds, 3 times, so a silent peer ends the connection in 14 seconds.
+	pub fn dead_peer() -> Self {
+		KeepaliveConfig {
+			enabled: true,
+			time: defaults::dead_peer_time(),
+			interval: defaults::dead_peer_interval(),
+			retries: defaults::dead_peer_retries(),
+			user_timeout: None,
+		}
+		.with_dead_peer_bound()
 	}
 }
 
@@ -3240,6 +3286,15 @@ pub mod defaults {
 	}
 	pub fn keepalive_time() -> Duration {
 		Duration::from_secs(180)
+	}
+	pub fn dead_peer_time() -> Duration {
+		Duration::from_secs(5)
+	}
+	pub fn dead_peer_interval() -> Duration {
+		Duration::from_secs(3)
+	}
+	pub fn dead_peer_retries() -> u32 {
+		3
 	}
 }
 
