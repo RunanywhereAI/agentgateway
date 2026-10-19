@@ -128,13 +128,13 @@ ext_proc server charges for tokens the client never received.
 
 ## The rebase onto v1.6.0
 
-The series is the fourteen commits of the final `ra/v1.5.0-ra.3` (head `2d7d2aa1`, on top of `v1.5.0`), in the same order and
+The series is the fifteen commits of the final `ra/v1.5.0-ra.3` (head `7a6d131e`, on top of `v1.5.0`), in the same order and
 with the same subjects. The first twelve (up to `ra/v1.5.0-ra.3-picker-wait-deadline-2`) were rebased onto `v1.6.0` by hand: the first
-four commits and the public-error commit were adapted, the rest applied unchanged. The last two (the deadline note in this file,
-and the public-error commit that makes the Messages rewrite set the JSON headers and the stale-assignment 503 the envelope) were
-added afterwards with the re-sync script, a `git cherry-pick -x` each: both applied without a conflict (v1.6.0 reworked
-`http/substrate/ingress.rs`, but the stale-assignment function the second commit changes is the same). No change was dropped: none
-of them is redundant on `v1.6.0`. The map from each original commit to its rebased one is kept with the consumer's evidence.
+four commits and the public-error commit were adapted, the rest applied unchanged. The last three (the deadline note in this file;
+the public-error commit that makes the Messages rewrite set the JSON headers and the stale-assignment 503 the envelope; and the
+integration tests that an authorization call which times out or cannot be reached is the 503 credit gate envelope) were added
+afterwards with the re-sync script, a `git cherry-pick -x` each, all without a conflict. No change was dropped: none of them is
+redundant on `v1.6.0`. The map from each original commit to its rebased one is kept with the consumer's evidence.
 
 - ext_proc (`crates/agentgateway/src/http/ext_proc.rs`): v1.6.0 replaced `http::DropBody` with the managed `Body`
   (`crates/http/src/body.rs`), so the token's drop guard is attached with `Body::with_drop_guard` (first commit) and the
@@ -153,6 +153,8 @@ of them is redundant on `v1.6.0`. The map from each original commit to its rebas
   authentication errors v1.6.0 splits into 500 (local) and 502 (credential provider) keep those statuses and get the public
   sentence of their status. The 429 of a local rate limit keeps v1.6.0's `Retry-After` (the envelope adds one only when the
   answer has none), and the answer of a remote rate limit service is still the service's own.
+- The authorization-timeout test (`an_authorization_call_that_times_out_is_a_503_credit_gate_unavailable`) sets the call's own
+  `requestTimeout` of 300 ms, so v1.6.0's new 2-second default for an external authorization call does not decide it.
 - Three upstream tests of v1.6.0 assert the text of an error the proxy now answers in the public envelope, and were adapted (same
   names, same status checks): the two MCP oversized-body tests (`mcp/mcp_tests.rs`, which expected the configured limit in the 413
   body) and `llm_custom_provider_rejects_unsupported_format_before_upstream_call` (`tests/tests/llm.rs`, which expected the
