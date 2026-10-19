@@ -6087,7 +6087,20 @@ mod body_streaming_and_trailers {
 		})]
 	}
 
-	struct AnswersBodiesAfter(Duration);
+	/// Answers the first chunk of a response body after `silence` and every other at once.
+	struct AnswersBodiesAfter {
+		silence: Duration,
+		answered: bool,
+	}
+
+	impl AnswersBodiesAfter {
+		fn new(silence: Duration) -> Self {
+			Self {
+				silence,
+				answered: false,
+			}
+		}
+	}
 
 	#[async_trait::async_trait]
 	impl Handler for AnswersBodiesAfter {
@@ -6096,7 +6109,10 @@ mod body_streaming_and_trailers {
 			body: &proto::HttpBody,
 			sender: &mpsc::Sender<Result<proto::ProcessingResponse, tonic::Status>>,
 		) -> Result<(), tonic::Status> {
-			tokio::time::sleep(self.0).await;
+			if !self.answered {
+				self.answered = true;
+				tokio::time::sleep(self.silence).await;
+			}
 			let _ = sender
 				.send(response_body_response(Some(CommonResponse {
 					body_mutation: Some(BodyMutation {
@@ -6120,7 +6136,7 @@ mod body_streaming_and_trailers {
 	#[tokio::test]
 	async fn a_processor_that_is_slow_but_alive_is_not_cut_by_the_dead_peer_bound() {
 		let silence = Duration::from_secs(5);
-		let ext_proc = ExtProcMock::new(move || AnswersBodiesAfter(silence))
+		let ext_proc = ExtProcMock::new(move || AnswersBodiesAfter::new(silence))
 			.spawn()
 			.await;
 		let mut ext_proc_request = build_ext_proc_request_with_policies(
@@ -6159,7 +6175,7 @@ mod body_streaming_and_trailers {
 	async fn a_processor_silent_for_longer_than_the_default_bound_but_alive_is_not_cut() {
 		let silence = Duration::from_secs(16);
 		assert!(silence > KeepaliveConfig::dead_peer().give_up_after());
-		let ext_proc = ExtProcMock::new(move || AnswersBodiesAfter(silence))
+		let ext_proc = ExtProcMock::new(move || AnswersBodiesAfter::new(silence))
 			.spawn()
 			.await;
 		let mut ext_proc_request = build_ext_proc_request_for_test(
