@@ -1,19 +1,22 @@
 # RunanywhereAI fork of agentgateway
 
-This branch, `ra/v1.5.0-ra.3`, is upstream tag `v1.5.0`
-(commit fe6732474a96a0363dfb9822859af4e9bab360fa) plus four changes and their tests. Nothing else differs.
-The branch `ra/v1.5.0-ra.2` carries the first two (the build `v1.5.0-ra.2`), and `ra/v1.5.0-client-leave` the first
-only (the build `v1.5.0-ra.1`).
+This branch, `ra/v1.6.0-ra.1`, is upstream tag `v1.6.0`
+(commit ea5608642b9d5c94c5baf5fd9f2f9849b808e963) plus the same four changes and their tests as the `v1.5.0` series
+(`ra/v1.5.0-ra.3`, rebased onto `v1.6.0`, see "The rebase onto v1.6.0" below). Nothing else differs.
+The `v1.5.0` branches stay as they were: `ra/v1.5.0-ra.3` and its picked-destination-wait follow-ups, `ra/v1.5.0-ra.2`
+(the first two changes, the build `v1.5.0-ra.2`) and `ra/v1.5.0-client-leave` (the first only, the build `v1.5.0-ra.1`).
+The build of this branch reports `v1.6.0-ra.1`.
 
 ## What it carries
 
 ### 1. Cancel the upstream, and the ext_proc call, when the client leaves
 
 When an ext_proc policy processes the response body in `FULL_DUPLEX_STREAMED` mode and the downstream
-client disconnects after the response headers were sent, upstream v1.5.0 keeps reading the upstream body
+client disconnects after the response headers were sent, upstream (v1.5.0 and v1.6.0) keeps reading the upstream body
 to its end in a detached task, and the ext_proc stream keeps receiving every chunk. This change ties that
 background work to ownership of the processed response body: a per-instance cancellation token, cancelled
-when the returned body is dropped (through the crate's own `http::DropBody`), aborts the upstream-body
+when the returned body is dropped (a drop guard held by the processed body: in v1.6.0 a content wrapper installed with
+`Body::transform_stream`, where v1.5.0 used the crate's own `http::DropBody`), aborts the upstream-body
 reader (dropping the upstream body, which cancels the upstream request), ends the gRPC request stream to
 the ext_proc server (`take_until` on the token) and stops the response continuation.
 
@@ -104,6 +107,9 @@ ext_proc server charges for tokens the client never received.
 
 ## Evidence
 
+- `v1.6.0-ra.1` (this branch): `cargo check --tests` of the `agentgateway`, `agent-celx` and `agent-hbone` crates is clean on
+  Rust 1.98.1. The test runs are Cloud Build runs of the consumer's ad-hoc test builds; their ids are in the consumer's
+  evidence, and the results are added here when they are in.
 - The half-close form of this change (`v1.5.0-ra.1`, branch `ra/v1.5.0-client-leave`): the body-streaming tests passed
   5 of 5, its test failed without the change, and the whole library suite passed (1994 passed, 0 failed, 1 ignored, with
   every `OTEL_*` variable unset: three upstream config tests read an OTLP endpoint from the environment).
@@ -114,9 +120,40 @@ ext_proc server charges for tokens the client never received.
 
 - Issue: not filed yet. The project's contribution policy asks that issues be written by a person; the
   report will be filed in the maintainers' own words, and its link added here.
-- This change does not apply cleanly on upstream `main` (c7ac602e, 310 commits after v1.5.0): the ext_proc
-  code moved. On `main` the crate's `DropBody` is gone and `Body::with_drop_guard` (`crates/http/src/body.rs`) takes
-  its place, so a port to `main` is the form an upstream pull request would take.
+- v1.6.0 carries none of the four changes: its ext_proc code still reads the upstream response body in a detached task
+  that nothing stops when the client leaves; the body field is still read whole by `jsonField`; the proxy's own errors are
+  still the error's text as `text/plain`; and the picker's chosen pod is still looked up once. What v1.6.0 does change near
+  them is listed below. The form an upstream pull request would take is the one this branch already has: v1.6.0 has no
+  `DropBody`, and `Body::with_drop_guard` (`crates/http/src/body.rs`) takes its place.
+
+## The rebase onto v1.6.0
+
+The series is the twelve commits of `ra/v1.5.0-ra.3-picker-wait-deadline-2` (on top of `v1.5.0`), in the same order and
+with the same subjects, rebased onto `v1.6.0`. The first four commits and the public-error commit were adapted, the rest
+applied unchanged. No change was dropped: none of them is redundant on `v1.6.0`.
+
+- ext_proc (`crates/agentgateway/src/http/ext_proc.rs`): v1.6.0 replaced `http::DropBody` with the managed `Body`
+  (`crates/http/src/body.rs`), so the token's drop guard is attached with `Body::with_drop_guard` (first commit) and the
+  processed body is installed as a content wrapper with `Body::transform_stream` (second commit). The request stream of
+  the call is v1.6.0's stream that reports its first poll, with `take_until` on the token on top. v1.6.0 spawns the
+  response continuation in two places (it added one for a buffered body that has trailers); both go through the new
+  helper `spawn_response_continuation`, which stops when the token is cancelled. v1.6.0 also added a flag that tells a
+  clean close of the call from a failure (`cleanly_closed`): the abort path does not set it, so a cancelled call is still
+  not taken for a clean close.
+- The mock server (`test_helpers/extprocmock.rs`) keeps v1.6.0's `close_stream` hook beside our `on_eof` and
+  `on_stream_error` hooks, and v1.6.0's new trailer tests stay in `body_streaming_and_trailers` in front of ours (the
+  module has nine tests of upstream's now, where v1.5.0 had four).
+- Public errors (`proxy/httpproxy.rs`): v1.6.0 resolves the answer of a failed request in `resolve_response` (which also
+  puts the error on the request's CEL context, "cel: expose `proxy.error` attributes"), and the envelope is still written
+  once at the end, after the response policies, so both a request failure and a policy failure are covered. The backend
+  authentication errors v1.6.0 splits into 500 (local) and 502 (credential provider) keep those statuses and get the public
+  sentence of their status. The 429 of a local rate limit keeps v1.6.0's `Retry-After` (the envelope adds one only when the
+  answer has none), and the answer of a remote rate limit service is still the service's own.
+- Behaviour of v1.6.0 that a consumer should know and this branch does not change: the external authorization call has a
+  default timeout of 2 seconds, and (the release notes' words) rate limit and external processing calls default to 10
+  seconds; a failure to get a credential from a provider is 502 where it was 500.
+- Build: v1.6.0's own `rust-toolchain.toml` names Rust 1.99.0 (its Dockerfile uses `rust:1.99.0-trixie`); the code needs
+  only `rust-version = 1.90`, and the crates type-check, test targets included, with Rust 1.98.1.
 
 ## Plan
 
