@@ -95,7 +95,8 @@ The endpoint picker follows the cluster's pods directly and the proxy's endpoint
 picker can name a pod the proxy has not been told about yet, and the call failed with "no healthy backends" for a pod that was Ready
 and serving. `build_service_call_for_picked_destination` (`proxy/httpproxy.rs`) repeats the endpoint lookup until the workload store
 inserts the pod, for at most two seconds (`PICKED_DESTINATION_WAIT`), with one last run at the deadline; the picker is not asked
-again and a destination still unknown fails exactly as before. Only a destination the picker chose for a Service backend (not a
+again and a destination still unknown fails exactly as before. The deadline is checked after every lookup, so inserts of other
+workloads cannot stretch the wait past the limit (`inserts_that_never_stop_do_not_extend_the_wait_past_the_limit`). Only a destination the picker chose for a Service backend (not a
 passthrough one) waits. Tests: `proxy::httpproxy::picked_destination_wait_tests::*` and
 `http::ext_proc::tests::standalone_inference_routing::standalone_inference_routing_waits_for_the_selected_destination_to_join_the_service`.
 (Commit `fe6e7bad`, by the consumer's picker-readiness work.)
