@@ -40,7 +40,8 @@ use crate::llm::{
 };
 use crate::proxy::tcpproxy::TCPProxy;
 use crate::proxy::{
-	ProxyError, ProxyResponse, ProxyResponseReason, WaypointService, dtrace, resolve_simple_backend,
+	ProxyError, ProxyResponse, ProxyResponseReason, WaypointService, dtrace, public_error,
+	resolve_simple_backend,
 };
 use crate::store::{
 	BackendPolicies, FrontendPolices, GatewayPolicies, LLMRequestPolicies, LLMResponsePolicies,
@@ -772,6 +773,8 @@ impl HTTPProxy {
 		// or direct responses
 		let mut response_policies = ResponsePolicies::default();
 		let is_grpc_request = http::is_grpc_request(&req);
+		// The shape of an error body the proxy makes itself is the dialect of the path the client called.
+		let error_dialect = public_error::Dialect::of_path(req.uri().path());
 		let ret = self
 			.proxy_internal(req, log.as_mut().unwrap(), &mut response_policies)
 			.await
@@ -788,6 +791,9 @@ impl HTTPProxy {
 		{
 			(resp, reason) = resolve_response(Err(failure), log.as_mut().unwrap(), is_grpc_request);
 		}
+		// An error the proxy made itself is written again for the request's dialect, now that the response
+		// policies have put the request id on it.
+		public_error::finish(&mut resp, error_dialect);
 		// LLM buffering deliberately leaves decoded bodies plain so response policies can safely read
 		// and replace them. Restore the upstream-selected encoding only after every such policy ran.
 		llm::encode_deferred_response(&mut resp);

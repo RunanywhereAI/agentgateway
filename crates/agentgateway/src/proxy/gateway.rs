@@ -982,9 +982,14 @@ impl Gateway {
 					request_shed.inc();
 					let is_grpc = crate::http::is_grpc_request(&req);
 					debug!(bind = %proxy.bind_name, "request rejected: request limit");
-					return Either::Left(future::ready(Ok::<_, Infallible>(
-						ProxyError::RequestLimitExceeded.into_response_with_grpc(is_grpc),
-					)));
+					// No policy has run for a request shed here, so it has no request id to quote; a Messages
+					// path is told in the Messages form with the id unknown.
+					let mut response = ProxyError::RequestLimitExceeded.into_response_with_grpc(is_grpc);
+					super::public_error::finish(
+						&mut response,
+						super::public_error::Dialect::of_path(req.uri().path()),
+					);
+					return Either::Left(future::ready(Ok::<_, Infallible>(response)));
 				};
 
 				if let Some(buffer) = buffer {

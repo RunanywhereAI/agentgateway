@@ -17,7 +17,7 @@ use crate::http::ext_proc::proto::{
 	ProcessingResponse,
 };
 use crate::http::{self, PolicyResponse, envoy_proto_common};
-use crate::proxy::ProxyError;
+use crate::proxy::{ProxyError, public_error};
 
 pub(super) fn to_immediate_response(rp: &ProcessingResponse) -> Option<PolicyResponse> {
 	match &rp.response {
@@ -37,6 +37,9 @@ pub(super) fn to_immediate_response(rp: &ProcessingResponse) -> Option<PolicyRes
 				.map_err(|e| ProxyError::Processing(e.into()))
 				.unwrap();
 			apply_header_mutations_response(&mut resp, headers.as_ref());
+			// A processor's plain-text error (the endpoint picker's refusal) is not sent to the client as it
+			// is: it is wrapped in the public error envelope. JSON answers (admission's, the meter's) stay.
+			public_error::seal_processor_refusal(&mut resp, body);
 			Some(crate::http::PolicyResponse {
 				direct_response: Some(resp),
 				response_headers: None,

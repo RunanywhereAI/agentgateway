@@ -39,6 +39,24 @@ use crate::types::agent::{
 use crate::types::discovery::{AppProtocol, NamespacedHostname};
 use crate::*;
 
+/// The body of an error the proxy made itself is the public error envelope with fixed words: it names
+/// `code` and carries nothing of the failure.
+fn assert_public_error_body(body: &[u8], code: &str) {
+	let value: serde_json::Value = serde_json::from_slice(body).expect("the error body is JSON");
+	assert_eq!(value["error"]["code"], code, "{value}");
+	assert!(value["error"]["param"].is_null(), "{value}");
+	let text = value.to_string();
+	for internal in [
+		"ext_proc",
+		"mutation",
+		"processing failed",
+		"dynamic backend",
+		"host:port",
+	] {
+		assert!(!text.contains(internal), "{text}");
+	}
+}
+
 // Processing-option decoding and default behavior.
 mod processing_option_defaults {
 	use super::*;
@@ -265,11 +283,7 @@ mod body_modes {
 		let res = send_request_body(io, Method::POST, "http://lo", b"request body").await;
 		assert_eq!(res.status(), 500);
 		let body = read_body_raw(res.into_body()).await;
-		assert!(
-			body
-				.as_ref()
-				.starts_with(b"ext_proc failed: invalid body mutation:")
-		);
+		assert_public_error_body(body.as_ref(), "internal");
 	}
 
 	#[tokio::test]
@@ -598,11 +612,7 @@ mod body_modes {
 		let res = send_request(io, Method::GET, "http://lo").await;
 		assert_eq!(res.status(), 500);
 		let body = read_body_raw(res.into_body()).await;
-		assert!(
-			body
-				.as_ref()
-				.starts_with(b"ext_proc failed: invalid body mutation:")
-		);
+		assert_public_error_body(body.as_ref(), "internal");
 	}
 
 	#[tokio::test]
@@ -1568,9 +1578,145 @@ mod immediate_and_failure {
 		)
 		.await;
 		let res = send_request_body(io, Method::POST, "http://lo", b"request").await;
+		// A processor's plain-text error is wrapped in the public error envelope (a 403 has no public code).
 		assert_eq!(res.status(), 403);
+		assert_eq!(res.headers()["content-type"], "application/json");
 		let body = read_body_raw(res.into_body()).await;
-		assert_eq!(body.as_ref(), b"Access denied");
+		let value: serde_json::Value = serde_json::from_slice(&body).expect("the error body is JSON");
+		assert_eq!(value["error"]["type"], "permission_error", "{value}");
+		assert!(value["error"]["code"].is_null(), "{value}");
+		assert!(!value.to_string().contains("Access denied"), "{value}");
+	}
+
+	// The endpoint picker's refusal is plain text with its own headers. The client is told the public
+	// envelope instead, with a Retry-After, and none of the picker's headers.
+	#[tokio::test]
+	async fn a_pickers_plain_text_refusal_reaches_the_client_as_the_public_envelope() {
+		let mock = simple_mock().await;
+		let (_mock, _ext_proc, _bind, io) = setup_ext_proc_mock(
+			mock,
+			ext_proc::FailureMode::FailClosed,
+			ExtProcMock::new(|| PickerRefusalExtProc {
+				code: 503,
+				body: PICKER_NO_ENDPOINTS,
+				reason: "rejected-no-endpoints",
+			}),
+			"{}",
+		)
+		.await;
+		let res = send_request_body(
+			io,
+			Method::POST,
+			"http://lo/v1/chat/completions",
+			b"request",
+		)
+		.await;
+		assert_eq!(res.status(), 503);
+		assert_eq!(res.headers()["content-type"], "application/json");
+		assert_eq!(res.headers()["retry-after"], "30");
+		assert!(
+			res
+				.headers()
+				.get("x-llm-d-request-dropped-reason")
+				.is_none()
+		);
+		assert!(
+			res
+				.headers()
+				.get("x-llm-d-flow-queue-duration-ms")
+				.is_none()
+		);
+		assert_eq!(res.headers()["x-kept"], "yes");
+		let body = read_body_raw(res.into_body()).await;
+		let value: serde_json::Value = serde_json::from_slice(&body).expect("the refusal is JSON");
+		assert_eq!(value["error"]["code"], "cold", "{value}");
+		assert_eq!(value["error"]["type"], "server_error", "{value}");
+		assert!(!value.to_string().contains("inference error"), "{value}");
+		assert!(!value.to_string().contains("endpoints"), "{value}");
+	}
+
+	#[tokio::test]
+	async fn a_pickers_full_queue_refusal_reaches_the_client_as_capacity_exceeded() {
+		let mock = simple_mock().await;
+		let (_mock, _ext_proc, _bind, io) = setup_ext_proc_mock(
+			mock,
+			ext_proc::FailureMode::FailClosed,
+			ExtProcMock::new(|| PickerRefusalExtProc {
+				code: 429,
+				body: "inference error: ResourceExhausted - system saturated",
+				reason: "rejected-saturated",
+			}),
+			"{}",
+		)
+		.await;
+		let res = send_request_body(
+			io,
+			Method::POST,
+			"http://lo/v1/chat/completions",
+			b"request",
+		)
+		.await;
+		assert_eq!(res.status(), 429);
+		assert_eq!(res.headers()["retry-after"], "12");
+		let body = read_body_raw(res.into_body()).await;
+		let value: serde_json::Value = serde_json::from_slice(&body).expect("the refusal is JSON");
+		assert_eq!(value["error"]["code"], "capacity_exceeded", "{value}");
+		assert_eq!(value["error"]["type"], "capacity", "{value}");
+	}
+
+	// On a Messages path the same refusal is the Messages error object.
+	#[tokio::test]
+	async fn a_pickers_refusal_on_a_messages_path_is_the_messages_envelope() {
+		let mock = simple_mock().await;
+		let (_mock, _ext_proc, _bind, io) = setup_ext_proc_mock(
+			mock,
+			ext_proc::FailureMode::FailClosed,
+			ExtProcMock::new(|| PickerRefusalExtProc {
+				code: 503,
+				body: PICKER_NO_ENDPOINTS,
+				reason: "rejected-no-endpoints",
+			}),
+			"{}",
+		)
+		.await;
+		let res = send_request_body(io, Method::POST, "http://lo/v1/messages", b"request").await;
+		assert_eq!(res.status(), 503);
+		assert_eq!(res.headers()["retry-after"], "30");
+		let body = read_body_raw(res.into_body()).await;
+		let value: serde_json::Value = serde_json::from_slice(&body).expect("the refusal is JSON");
+		assert_eq!(value["type"], "error", "{value}");
+		assert_eq!(value["error"]["type"], "overloaded_error", "{value}");
+		assert_eq!(value["request_id"], "unknown", "{value}");
+		assert!(!value.to_string().contains("inference error"), "{value}");
+	}
+
+	// Admission's and the meter's own refusals are JSON already: they reach the client byte for byte.
+	#[tokio::test]
+	async fn a_json_refusal_of_a_processor_reaches_the_client_unchanged() {
+		let mock = simple_mock().await;
+		let (_mock, _ext_proc, _bind, io) = setup_ext_proc_mock(
+			mock,
+			ext_proc::FailureMode::FailClosed,
+			ExtProcMock::new(|| PickerRefusalExtProc {
+				code: 503,
+				body: CREDIT_GATE_ENVELOPE,
+				reason: "",
+			}),
+			"{}",
+		)
+		.await;
+		let res = send_request_body(
+			io,
+			Method::POST,
+			"http://lo/v1/chat/completions",
+			b"request",
+		)
+		.await;
+		assert_eq!(res.status(), 503);
+		assert_eq!(res.headers()["content-type"], "application/json");
+		assert_eq!(res.headers()["retry-after"], "10");
+		let body = read_body_raw(res.into_body()).await;
+		assert_eq!(body.as_ref(), CREDIT_GATE_ENVELOPE.as_bytes());
 	}
 
 	// Regression guard: a normal full-duplex request body (no ImmediateResponse) must stream
@@ -1677,7 +1823,8 @@ mod immediate_and_failure {
 		// downstream client.
 		assert_eq!(res.status(), 400);
 		let body = read_body_raw(res.into_body()).await;
-		assert_eq!(body.as_ref(), b"late immediate");
+		assert_public_error_body(body.as_ref(), "bad_request");
+		assert!(!String::from_utf8_lossy(&body).contains("late immediate"));
 	}
 
 	#[tokio::test]
@@ -1693,7 +1840,7 @@ mod immediate_and_failure {
 		let res = send_request_body(io, Method::POST, "http://lo", b"request").await;
 		assert_eq!(res.status(), 500);
 		let body = read_body_raw(res.into_body()).await;
-		assert!(body.as_ref().starts_with(b"ext_proc failed:"));
+		assert_public_error_body(body.as_ref(), "internal");
 	}
 
 	#[tokio::test]
@@ -1825,7 +1972,7 @@ mod immediate_and_failure {
 		let res = send_request_body(io, Method::POST, "http://lo", b"request").await;
 		assert_eq!(res.status(), 500);
 		let body = read_body_raw(res.into_body()).await;
-		assert!(body.as_ref().starts_with(b"ext_proc failed:"));
+		assert_public_error_body(body.as_ref(), "internal");
 	}
 
 	#[tokio::test]
@@ -2195,11 +2342,7 @@ mod dynamic_backend_target {
 		.unwrap();
 		assert_eq!(res.status(), 503);
 		let body = read_body_raw(res.into_body()).await;
-		assert!(
-			body
-				.as_ref()
-				.starts_with(b"processing failed: dynamic backend target expression must evaluate")
-		);
+		assert_public_error_body(body.as_ref(), "gateway_unavailable");
 	}
 
 	#[tokio::test]
@@ -2226,9 +2369,7 @@ mod dynamic_backend_target {
 		.unwrap();
 		assert_eq!(res.status(), 503);
 		let body = read_body_raw(res.into_body()).await;
-		assert!(body.as_ref().starts_with(
-			b"processing failed: dynamic backend target \"not-a-hostport\": invalid host:port"
-		));
+		assert_public_error_body(body.as_ref(), "gateway_unavailable");
 	}
 }
 
@@ -3539,6 +3680,60 @@ impl Handler for BBRExtProc {
 				})))
 				.await;
 		}
+		Ok(())
+	}
+}
+
+const PICKER_NO_ENDPOINTS: &str = "inference error: ServiceUnavailable - request timed out in queue and no endpoints are available: request evicted from queue: request TTL expired: no endpoints available";
+const CREDIT_GATE_ENVELOPE: &str = r#"{"error":{"message":"Billing is temporarily unavailable. Try again shortly.","type":"server_error","code":"credit_gate_unavailable","param":null}}"#;
+
+/// A processor that refuses every request at its headers: the endpoint picker's plain text (with its
+/// `x-llm-d-*` headers) when `reason` is not empty, or a JSON envelope with its content type and a
+/// Retry-After when `body` is JSON.
+#[derive(Debug)]
+struct PickerRefusalExtProc {
+	code: i32,
+	body: &'static str,
+	reason: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Handler for PickerRefusalExtProc {
+	async fn handle_request_headers(
+		&mut self,
+		_: &HttpHeaders,
+		sender: &mpsc::Sender<Result<ProcessingResponse, Status>>,
+	) -> Result<(), Status> {
+		let option = |key: &str, value: &str| HeaderValueOption {
+			header: Some(HeaderValue {
+				key: key.to_string(),
+				value: String::new(),
+				raw_value: value.as_bytes().to_vec(),
+			}),
+			append: Some(false),
+			..Default::default()
+		};
+		let mut set_headers = vec![option("x-kept", "yes")];
+		if self.reason.is_empty() {
+			set_headers.push(option("content-type", "application/json"));
+			set_headers.push(option("retry-after", "10"));
+		} else {
+			set_headers.push(option("x-llm-d-request-dropped-reason", self.reason));
+			set_headers.push(option("x-llm-d-flow-queue-duration-ms", "10012"));
+			set_headers.push(option("content-length", &self.body.len().to_string()));
+		}
+		let _ = sender
+			.send(immediate_response(proto::ImmediateResponse {
+				status: Some(proto::HttpStatus { code: self.code }),
+				body: self.body.to_string(),
+				headers: Some(HeaderMutation {
+					set_headers,
+					remove_headers: Vec::new(),
+				}),
+				grpc_status: None,
+				details: "".to_string(),
+			}))
+			.await;
 		Ok(())
 	}
 }
