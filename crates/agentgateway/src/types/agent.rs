@@ -3219,13 +3219,10 @@ pub struct KeepaliveConfig {
 	/// unacknowledged, so without it a stream that is still being written to a peer that has gone
 	/// silent (no FIN or RST ever arrived) is not ended by the probes above. A keepalive set by a
 	/// policy, or by `KeepaliveConfig::dead_peer`, sets it to `time + interval * retries`, the time the
-	/// probes themselves take to declare an idle peer dead.
-	#[serde(
-		default,
-		skip_serializing_if = "Option::is_none",
-		with = "crate::serdes::serde_dur_option"
-	)]
-	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+	/// probes themselves take to declare an idle peer dead. It is derived, never read from a config
+	/// file, so it is not in the config schema.
+	#[serde(skip)]
+	#[cfg_attr(feature = "schema", schemars(skip))]
 	pub user_timeout: Option<Duration>,
 }
 

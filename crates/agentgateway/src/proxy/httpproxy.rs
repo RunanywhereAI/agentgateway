@@ -3949,7 +3949,64 @@ mod tests {
 	use super::{
 		SpiffeBackendTLS, apply_auto_hostname, apply_llm_request_policies, hop_by_hop_headers,
 		resolved_workload_target_hostname, select_service_target_port, spiffe_backend_alpns,
+		with_dead_peer_keepalive,
 	};
+
+	#[test]
+	fn an_ext_proc_call_with_no_keepalive_policy_gets_the_dead_peer_keepalive() {
+		use crate::store::BackendPolicies;
+		use crate::types::agent::KeepaliveConfig;
+
+		let mut policies = BackendPolicies::default();
+		with_dead_peer_keepalive(&mut policies);
+		let keepalives = policies.tcp.unwrap().keepalives.unwrap();
+		assert_eq!(keepalives, KeepaliveConfig::dead_peer());
+		assert_eq!(keepalives.user_timeout, Some(std::time::Duration::from_secs(14)));
+	}
+
+	#[test]
+	fn a_tcp_policy_without_a_keepalive_keeps_its_connect_timeout_and_gets_the_dead_peer_keepalive() {
+		use crate::store::BackendPolicies;
+		use crate::types::agent::KeepaliveConfig;
+		use crate::types::backend::TCP;
+
+		let connect_timeout = Some(std::time::Duration::from_secs(3));
+		let mut policies = BackendPolicies {
+			tcp: Some(TCP {
+				keepalives: None,
+				connect_timeout,
+			}),
+			..Default::default()
+		};
+		with_dead_peer_keepalive(&mut policies);
+		let tcp = policies.tcp.unwrap();
+		assert_eq!(tcp.connect_timeout, connect_timeout);
+		assert_eq!(tcp.keepalives, Some(KeepaliveConfig::dead_peer()));
+	}
+
+	#[test]
+	fn a_keepalive_a_policy_sets_on_an_ext_proc_backend_is_kept() {
+		use crate::store::BackendPolicies;
+		use crate::types::agent::KeepaliveConfig;
+		use crate::types::backend::TCP;
+
+		let theirs = KeepaliveConfig {
+			enabled: true,
+			time: std::time::Duration::from_secs(60),
+			interval: std::time::Duration::from_secs(10),
+			retries: 4,
+			user_timeout: None,
+		};
+		let mut policies = BackendPolicies {
+			tcp: Some(TCP {
+				keepalives: Some(theirs.clone()),
+				connect_timeout: None,
+			}),
+			..Default::default()
+		};
+		with_dead_peer_keepalive(&mut policies);
+		assert_eq!(policies.tcp.unwrap().keepalives, Some(theirs));
+	}
 
 	#[test]
 	fn spiffe_backend_alpns_explicit_alpn_is_fixed() {

@@ -10,7 +10,7 @@ pub mod proxymock;
 pub mod ratelimitmock;
 pub use common::MockInstance;
 #[cfg(test)]
-pub(crate) use common::spawn_service;
+pub(crate) use common::{spawn_service, wedged_peer};
 #[cfg(any(test, feature = "internal_benches"))]
 pub use policy::{policy_client, test_policy};
 
@@ -66,6 +66,33 @@ mod common {
 			address: addr,
 			handle: task,
 		}
+	}
+
+	/// A TCP peer that accepts one connection and then neither reads from it nor writes to it, with
+	/// the smallest receive buffer the kernel allows (the accepted socket inherits it from the
+	/// listener). After a few KB it offers a window of zero: what a sender writes past that stays
+	/// unsent in its own kernel, and the sender's kernel can only probe the window, which the peer's
+	/// kernel keeps answering. It is how a test makes a connection that has data to send and no
+	/// progress, without dropping packets (which needs privileges a test does not have).
+	#[cfg(test)]
+	pub async fn wedged_peer() -> MockInstance {
+		use socket2::{Domain, Socket, Type};
+
+		let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+		socket.set_recv_buffer_size(1).unwrap();
+		socket
+			.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+			.unwrap();
+		socket.listen(8).unwrap();
+		socket.set_nonblocking(true).unwrap();
+		let listener = tokio::net::TcpListener::from_std(socket.into()).unwrap();
+		let address = listener.local_addr().unwrap();
+		let handle = tokio::spawn(async move {
+			let (connection, _) = listener.accept().await.unwrap();
+			std::future::pending::<()>().await;
+			drop(connection);
+		});
+		MockInstance { address, handle }
 	}
 
 	pub async fn spawn_service_on<S>(srv: S, address: SocketAddr) -> MockInstance
