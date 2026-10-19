@@ -108,9 +108,8 @@ ext_proc server charges for tokens the client never received.
 
 ## Evidence
 
-- `v1.6.0-ra.1` (this branch): `cargo check --tests` of the `agentgateway`, `agent-celx` and `agent-hbone` crates is clean on
-  Rust 1.98.1. The test runs are Cloud Build runs of the consumer's ad-hoc test builds; their ids are in the consumer's
-  evidence, and the results are added here when they are in.
+- `v1.6.0-ra.1` (this branch): the tests are Cloud Build runs of the consumer's ad-hoc test builds (the consumer's evidence holds
+  their ids and results), on Rust 1.98.0.
 - The half-close form of this change (`v1.5.0-ra.1`, branch `ra/v1.5.0-client-leave`): the body-streaming tests passed
   5 of 5, its test failed without the change, and the whole library suite passed (1994 passed, 0 failed, 1 ignored, with
   every `OTEL_*` variable unset: three upstream config tests read an OTLP endpoint from the environment).
@@ -154,6 +153,14 @@ of them is redundant on `v1.6.0`. The map from each original commit to its rebas
   authentication errors v1.6.0 splits into 500 (local) and 502 (credential provider) keep those statuses and get the public
   sentence of their status. The 429 of a local rate limit keeps v1.6.0's `Retry-After` (the envelope adds one only when the
   answer has none), and the answer of a remote rate limit service is still the service's own.
+- Three upstream tests of v1.6.0 assert the text of an error the proxy now answers in the public envelope, and were adapted (same
+  names, same status checks): the two MCP oversized-body tests (`mcp/mcp_tests.rs`, which expected the configured limit in the 413
+  body) and `llm_custom_provider_rejects_unsupported_format_before_upstream_call` (`tests/tests/llm.rs`, which expected the
+  conversion error's text in the 400 body). Each now requires the envelope's code and fixed sentence. The Cloud Build run of every test
+  target of the crate found them; nothing else of the integration binary fails (317 passed).
+- Flaky on the unpatched v1.6.0 too: a few `http::apikey` tests (`test_apikey_sha256_*`, `test_apikey_cookie_*`, and others,
+  a different one in different runs) fail in some Cloud Build runs of the library suite whether or not the patch is applied; a rerun
+  passes. They are not ours and are not changed.
 - Behaviour of v1.6.0 that a consumer should know and this branch does not change: the external authorization call has a
   default timeout of 2 seconds, and (the release notes' words) rate limit and external processing calls default to 10
   seconds; a failure to get a credential from a provider is 502 where it was 500.
