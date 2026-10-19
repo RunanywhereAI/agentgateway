@@ -201,7 +201,7 @@ impl Code {
 			Code::InvalidApiKey => "The API key is missing, malformed or unknown.",
 			Code::UserRateLimited => "The key has reached its rate limit.",
 			Code::CapacityExceeded => "No capacity is free for this model right now.",
-			Code::UnsupportedEndpoint => "This endpoint does not support this request.",
+			Code::UnsupportedEndpoint => "This model does not support this endpoint.",
 			Code::GatewayUnavailable => "The gateway is unavailable.",
 			Code::CreditGateUnavailable => "The credit check could not be completed.",
 			Code::Internal => "An internal error occurred.",
