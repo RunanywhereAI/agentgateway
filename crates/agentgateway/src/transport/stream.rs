@@ -400,7 +400,7 @@ fn set_keepalive(socket: socket2::SockRef<'_>, keepalives: &KeepaliveConfig) -> 
 	tracing::trace!("set keepalive: {:?}", res);
 	#[cfg(any(target_os = "linux", target_os = "android"))]
 	if let Some(user_timeout) = keepalives.user_timeout {
-		socket.set_tcp_user_timeout(Some(user_timeout))?;
+		let _ = user_timeout; // BREAK RUN A: the user timeout is not set
 	}
 	Ok(())
 }
