@@ -2166,16 +2166,36 @@ async fn build_simple_backend_call(
 			{
 				auto.target = Some(svc.hostname.clone());
 			}
-			build_service_call(
-				inputs,
-				policies,
-				log,
-				service_override,
-				svc,
-				port,
-				req.uri().host(),
-				hbone_source,
-			)?
+			// The endpoint picker follows the cluster's pods directly and the proxy's endpoint set
+			// follows them through the controller, so the picker can name a pod the proxy has not
+			// been told about yet. That is a delay, not a refusal: wait for it (below).
+			if maybe_inference.is_some()
+				&& service_override.destination.is_some()
+				&& !service_override.destination_passthrough
+			{
+				build_service_call_for_picked_destination(
+					inputs,
+					policies,
+					log,
+					service_override,
+					svc,
+					port,
+					req.uri().host(),
+					hbone_source,
+				)
+				.await?
+			} else {
+				build_service_call(
+					inputs,
+					policies,
+					log,
+					service_override,
+					svc,
+					port,
+					req.uri().host(),
+					hbone_source,
+				)?
+			}
 		},
 		SimpleBackend::Opaque(_, target) => BackendCall::from_shared(target.clone(), policies),
 		SimpleBackend::Aws(_, config) => {
@@ -3105,6 +3125,102 @@ fn build_connect_backend_call(
 	}
 }
 
+/// How long a request waits for the pod the endpoint picker chose to reach the proxy's own endpoint set.
+///
+/// The picker watches the pods directly and answers a queued request within milliseconds of a pod
+/// becoming Ready (a request sent to an empty pool waits in the picker for exactly that). The proxy
+/// learns of the pod from the controller, which debounces for up to one second and then pushes it.
+/// In between, the address the picker chose is not yet one of the Service's endpoints and the call
+/// fails with "no healthy backends" for a pod that is Ready and serving. The pod arrives within the
+/// controller's debounce and one push, so twice the debounce's maximum is a bound; a destination
+/// still unknown at the end fails exactly as it did before.
+const PICKED_DESTINATION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Runs `attempt` until it stops failing with `NoHealthyEndpoints`, waiting between two runs for the
+/// next insert into the workload store, and for no longer than `limit` in all. There is one last run
+/// when the wait ends, so an insert that lands at the deadline counts. `inserts` must be subscribed
+/// before the first run, so an insert between a run and the wait still wakes it. Any other result,
+/// and the last failure, are returned unchanged.
+async fn until_discovered<T>(
+	mut inserts: tokio::sync::watch::Receiver<()>,
+	limit: std::time::Duration,
+	mut attempt: impl FnMut() -> Result<T, ProxyError>,
+) -> Result<T, ProxyError> {
+	let deadline = tokio::time::Instant::now() + limit;
+	loop {
+		match attempt() {
+			Err(ProxyError::NoHealthyEndpoints) => {},
+			done => return done,
+		}
+		match tokio::time::timeout_at(deadline, inserts.changed()).await {
+			Ok(Ok(())) => {},
+			_ => return attempt(),
+		}
+	}
+}
+
+/// `build_service_call` for a destination the endpoint picker chose: wait up to
+/// `PICKED_DESTINATION_WAIT` for the Service's endpoints to hold it. The picker is not asked again
+/// and the address stays the one it chose; only the lookup is repeated.
+#[allow(clippy::too_many_arguments)]
+async fn build_service_call_for_picked_destination(
+	inputs: &ProxyInputs,
+	backend_policies: Arc<BackendPolicies>,
+	log: &mut Option<&mut RequestLog>,
+	service_override: ServiceCallOverride,
+	svc: &Arc<Service>,
+	port: &u16,
+	request_host: Option<&str>,
+	hbone_source: Option<HboneSourceRole>,
+) -> Result<BackendCall, ProxyError> {
+	// Subscribed before the first read, so an insert between that read and the wait is not missed.
+	let inserts = inputs.stores.read_discovery().workloads.subscribe_inserts();
+	let started = tokio::time::Instant::now();
+	let mut runs = 0_u32;
+	let result = until_discovered(inserts, PICKED_DESTINATION_WAIT, || {
+		runs += 1;
+		// A Service update can replace the Service this request started with, and its endpoint
+		// set with it, so a later run reads the current one.
+		let current;
+		let svc = if runs == 1 {
+			svc
+		} else {
+			current = inputs
+				.stores
+				.read_discovery()
+				.services
+				.get_by_namespaced_host(&svc.namespaced_hostname())
+				.unwrap_or_else(|| svc.clone());
+			&current
+		};
+		build_service_call(
+			inputs,
+			backend_policies.clone(),
+			&mut *log,
+			service_override,
+			svc,
+			port,
+			request_host,
+			hbone_source,
+		)
+	})
+	.await;
+	match &result {
+		Ok(_) if runs > 1 => tracing::info!(
+			waited = ?started.elapsed(),
+			destination = ?service_override.destination,
+			"the endpoint the picker chose reached the proxy's endpoint set after a wait"
+		),
+		Err(ProxyError::NoHealthyEndpoints) => tracing::warn!(
+			waited = ?started.elapsed(),
+			destination = ?service_override.destination,
+			"the endpoint the picker chose is not in the proxy's endpoint set"
+		),
+		_ => {},
+	}
+	result
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_service_call(
 	inputs: &ProxyInputs,
@@ -3530,6 +3646,205 @@ fn is_stale_assignment(res: &Result<Response, SnapshottedProxyResponse>) -> bool
 		Err(SnapshottedProxyResponse(ProxyResponse::Error(_) | ProxyResponse::DirectResponse(_))) => {
 			false
 		},
+	}
+}
+
+#[cfg(test)]
+mod picked_destination_wait_tests {
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+	use std::time::Duration;
+
+	use tokio::sync::watch;
+	use tokio::time::Instant;
+
+	use super::until_discovered;
+	use crate::proxy::ProxyError;
+
+	const LIMIT: Duration = Duration::from_secs(2);
+	// The paused clock lands on a timer's deadline rounded up to the millisecond.
+	const SLACK: Duration = Duration::from_millis(10);
+
+	/// What one run reads: whether the picked destination is in the endpoint set yet, and how often
+	/// the set was read.
+	struct Destination {
+		known: AtomicBool,
+		reads: AtomicU32,
+	}
+
+	impl Destination {
+		fn new(known: bool) -> Arc<Self> {
+			Arc::new(Self {
+				known: AtomicBool::new(known),
+				reads: AtomicU32::new(0),
+			})
+		}
+
+		fn read(&self) -> Result<u32, ProxyError> {
+			let reads = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+			if self.known.load(Ordering::SeqCst) {
+				Ok(reads)
+			} else {
+				Err(ProxyError::NoHealthyEndpoints)
+			}
+		}
+
+		fn reads(&self) -> u32 {
+			self.reads.load(Ordering::SeqCst)
+		}
+	}
+
+	/// Makes `destination` known after `after`, and tells the waiter if `notify`.
+	fn arrives(
+		destination: &Arc<Destination>,
+		inserts: &Arc<watch::Sender<()>>,
+		after: Duration,
+		notify: bool,
+	) -> tokio::task::JoinHandle<()> {
+		let destination = destination.clone();
+		let inserts = inserts.clone();
+		tokio::spawn(async move {
+			tokio::time::sleep(after).await;
+			destination.known.store(true, Ordering::SeqCst);
+			if notify {
+				let _ = inserts.send(());
+			}
+		})
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_destination_the_proxy_already_knows_is_not_waited_for() {
+		let (_inserts, rx) = watch::channel(());
+		let destination = Destination::new(true);
+		let started = Instant::now();
+
+		let result = until_discovered(rx, LIMIT, || destination.read()).await;
+
+		assert!(matches!(result, Ok(1)), "{result:?}");
+		assert_eq!(destination.reads(), 1);
+		assert_eq!(started.elapsed(), Duration::ZERO);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_destination_that_arrives_during_the_wait_is_used_when_it_arrives() {
+		let (inserts, rx) = watch::channel(());
+		let inserts = Arc::new(inserts);
+		let destination = Destination::new(false);
+		let arrival = arrives(&destination, &inserts, Duration::from_millis(300), true);
+		let started = Instant::now();
+
+		let result = until_discovered(rx, LIMIT, || destination.read()).await;
+		arrival.await.unwrap();
+
+		assert!(matches!(result, Ok(2)), "{result:?}");
+		assert!(started.elapsed() >= Duration::from_millis(300), "{:?}", started.elapsed());
+		assert!(started.elapsed() < Duration::from_millis(300) + SLACK, "{:?}", started.elapsed());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn an_insert_that_is_not_the_destination_does_not_end_the_wait() {
+		let (inserts, rx) = watch::channel(());
+		let inserts = Arc::new(inserts);
+		let destination = Destination::new(false);
+		let other = tokio::spawn({
+			let inserts = inserts.clone();
+			async move {
+				tokio::time::sleep(Duration::from_millis(100)).await;
+				let _ = inserts.send(());
+			}
+		});
+		let arrival = arrives(&destination, &inserts, Duration::from_millis(500), true);
+		let started = Instant::now();
+
+		let result = until_discovered(rx, LIMIT, || destination.read()).await;
+		other.await.unwrap();
+		arrival.await.unwrap();
+
+		// The first run, the run the other insert woke, and the run the destination's insert woke.
+		assert!(matches!(result, Ok(3)), "{result:?}");
+		assert!(started.elapsed() >= Duration::from_millis(500), "{:?}", started.elapsed());
+		assert!(started.elapsed() < Duration::from_millis(500) + SLACK, "{:?}", started.elapsed());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_destination_that_never_arrives_fails_with_the_same_error_at_the_limit() {
+		let (_inserts, rx) = watch::channel(());
+		let destination = Destination::new(false);
+		let started = Instant::now();
+
+		let result = until_discovered(rx, LIMIT, || destination.read()).await;
+
+		assert!(matches!(result, Err(ProxyError::NoHealthyEndpoints)), "{result:?}");
+		// The first run, and the last one the end of the wait makes.
+		assert_eq!(destination.reads(), 2);
+		assert!(started.elapsed() >= LIMIT, "{:?}", started.elapsed());
+		assert!(started.elapsed() < LIMIT + SLACK, "{:?}", started.elapsed());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_destination_that_arrives_without_a_notice_is_found_by_the_last_run() {
+		let (inserts, rx) = watch::channel(());
+		let inserts = Arc::new(inserts);
+		let destination = Destination::new(false);
+		let arrival = arrives(&destination, &inserts, LIMIT - Duration::from_millis(1), false);
+
+		let result = until_discovered(rx, LIMIT, || destination.read()).await;
+		arrival.await.unwrap();
+
+		assert!(matches!(result, Ok(2)), "{result:?}");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn an_insert_between_a_read_and_the_wait_is_not_missed() {
+		let (inserts, rx) = watch::channel(());
+		let started = Instant::now();
+		let mut runs = 0_u32;
+
+		// The destination arrives, and the store says so, while the first run is still reading.
+		let result = until_discovered(rx, LIMIT, || {
+			runs += 1;
+			if runs == 1 {
+				let _ = inserts.send(());
+				Err(ProxyError::NoHealthyEndpoints)
+			} else {
+				Ok(runs)
+			}
+		})
+		.await;
+
+		assert!(matches!(result, Ok(2)), "{result:?}");
+		assert_eq!(started.elapsed(), Duration::ZERO);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_store_that_is_gone_ends_the_wait_with_one_last_run() {
+		let (inserts, rx) = watch::channel(());
+		drop(inserts);
+		let destination = Destination::new(false);
+		let started = Instant::now();
+
+		let result = until_discovered(rx, LIMIT, || destination.read()).await;
+
+		assert!(matches!(result, Err(ProxyError::NoHealthyEndpoints)), "{result:?}");
+		assert_eq!(destination.reads(), 2);
+		assert_eq!(started.elapsed(), Duration::ZERO);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn any_other_error_is_returned_at_once() {
+		let (_inserts, rx) = watch::channel(());
+		let started = Instant::now();
+		let mut runs = 0_u32;
+
+		let result: Result<(), ProxyError> = until_discovered(rx, LIMIT, || {
+			runs += 1;
+			Err(ProxyError::ServiceNotFound)
+		})
+		.await;
+
+		assert!(matches!(result, Err(ProxyError::ServiceNotFound)), "{result:?}");
+		assert_eq!(runs, 1);
+		assert_eq!(started.elapsed(), Duration::ZERO);
 	}
 }
 

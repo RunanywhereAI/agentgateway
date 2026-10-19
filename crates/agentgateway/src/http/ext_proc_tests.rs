@@ -2930,6 +2930,68 @@ mod standalone_inference_routing {
 		);
 	}
 
+	/// Tells the proxy's discovery store that `address` is a Healthy endpoint of the standalone
+	/// service, as the controller's push of a pod that has become Ready does.
+	fn add_standalone_endpoint(pi: &ProxyInputs, address: SocketAddr) {
+		let workload = crate::store::LocalWorkload {
+			workload: crate::types::discovery::Workload {
+				uid: "model-pod".into(),
+				name: "model-pod".into(),
+				namespace: "default".into(),
+				workload_ips: vec![address.ip()],
+				..Default::default()
+			},
+			services: HashMap::from([(
+				STANDALONE_SERVICE_REF.to_string(),
+				HashMap::from([(STANDALONE_SERVICE_PORT, address.port())]),
+			)]),
+		};
+		pi.stores
+			.discovery
+			.sync_local(vec![], vec![workload], Default::default())
+			.unwrap();
+	}
+
+	// The endpoint picker follows the pods directly and the proxy follows them through the
+	// controller, so a pod that has just become Ready can be named by the picker before the proxy's
+	// endpoint set holds it. The request waits for the push instead of failing with "no healthy
+	// backends", the picker is asked once, and the pod serves it.
+	#[tokio::test]
+	async fn standalone_inference_routing_waits_for_the_selected_destination_to_join_the_service() {
+		let backend = named_backend("backend").await;
+		let request_headers_seen = Arc::new(AtomicUsize::new(0));
+		let (_ext_proc, bind, io) =
+			setup_inference_routing_mock(Some(*backend.address()), request_headers_seen.clone(), None)
+				.await;
+		let address = *backend.address();
+		let pi = bind.pi.clone();
+		let joins = tokio::spawn(async move {
+			tokio::time::sleep(Duration::from_millis(300)).await;
+			add_standalone_endpoint(&pi, address);
+		});
+
+		let res = send_request(io, Method::GET, "http://lo").await;
+		joins.await.unwrap();
+
+		assert_eq!(res.status(), 200);
+		let body = read_body_raw(res.into_body()).await;
+		assert_eq!(body.as_ref(), b"backend");
+		assert_eq!(
+			request_headers_seen.load(Ordering::SeqCst),
+			1,
+			"the picker is asked once; the wait repeats only the lookup",
+		);
+		assert_eq!(
+			backend
+				.received_requests()
+				.await
+				.expect("backend recording should be enabled")
+				.len(),
+			1,
+			"the selected endpoint serves the request once it has joined the service",
+		);
+	}
+
 	#[tokio::test]
 	async fn standalone_inference_routing_requires_epp_selected_destination() {
 		let client_selected_backend = named_backend("client-selected-backend").await;
