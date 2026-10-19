@@ -86,7 +86,7 @@ Not changed: protocol-level answers hyper writes before the proxy sees a request
 route's 501: the consumer's edge uses none of them.
 
 Files: `crates/agentgateway/src/proxy/public_error.rs` (new, with `public_error_tests.rs`), `proxy/mod.rs`,
-`proxy/httpproxy.rs`, `proxy/gateway.rs`, `http/ext_proc/mutation.rs`, `http/ext_authz.rs`, and the tests that asserted the old
+`proxy/httpproxy.rs`, `proxy/gateway.rs`, `http/ext_proc/mutation.rs`, `http/ext_authz.rs`, `http/substrate/ingress.rs` (the stale-assignment 503), and the tests that asserted the old
 text (`http/ext_proc_tests.rs`, `tests/tests/policy.rs`, `auth.rs`, `dfp.rs`).
 
 ### 4. A request waits for the pod the endpoint picker chose
@@ -129,9 +129,13 @@ ext_proc server charges for tokens the client never received.
 
 ## The rebase onto v1.6.0
 
-The series is the twelve commits of `ra/v1.5.0-ra.3-picker-wait-deadline-2` (on top of `v1.5.0`), in the same order and
-with the same subjects, rebased onto `v1.6.0`. The first four commits and the public-error commit were adapted, the rest
-applied unchanged. No change was dropped: none of them is redundant on `v1.6.0`.
+The series is the fourteen commits of the final `ra/v1.5.0-ra.3` (head `2d7d2aa1`, on top of `v1.5.0`), in the same order and
+with the same subjects. The first twelve (up to `ra/v1.5.0-ra.3-picker-wait-deadline-2`) were rebased onto `v1.6.0` by hand: the first
+four commits and the public-error commit were adapted, the rest applied unchanged. The last two (the deadline note in this file,
+and the public-error commit that makes the Messages rewrite set the JSON headers and the stale-assignment 503 the envelope) were
+added afterwards with the re-sync script, a `git cherry-pick -x` each: both applied without a conflict (v1.6.0 reworked
+`http/substrate/ingress.rs`, but the stale-assignment function the second commit changes is the same). No change was dropped: none
+of them is redundant on `v1.6.0`. The map from each original commit to its rebased one is kept with the consumer's evidence.
 
 - ext_proc (`crates/agentgateway/src/http/ext_proc.rs`): v1.6.0 replaced `http::DropBody` with the managed `Body`
   (`crates/http/src/body.rs`), so the token's drop guard is attached with `Body::with_drop_guard` (first commit) and the
