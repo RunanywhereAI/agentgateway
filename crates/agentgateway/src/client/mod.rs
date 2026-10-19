@@ -833,7 +833,7 @@ mod tests {
 	use crate::types::agent::TunnelProtocol;
 
 	#[test]
-	fn a_keepalive_a_policy_names_also_bounds_how_long_sent_data_may_stay_unacknowledged() {
+	fn a_policy_keepalive_also_bounds_how_long_sent_data_may_stay_unacknowledged() {
 		use crate::types::agent::KeepaliveConfig;
 
 		let base = crate::BackendConfig::default();
