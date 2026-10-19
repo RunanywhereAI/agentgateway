@@ -2552,6 +2552,17 @@ async fn modern_malformed_known_method_params_are_not_method_not_found() {
 	);
 }
 
+/// The body of a 413 the proxy makes itself: the public error envelope, whose sentence names no limit.
+fn assert_public_payload_too_large(text: &str) {
+	let body: serde_json::Value =
+		serde_json::from_str(text).expect("the 413 body is the JSON envelope");
+	assert_eq!(body["error"]["code"], "payload_too_large", "{text}");
+	assert_eq!(
+		body["error"]["message"], "The request body is over the size limit.",
+		"{text}"
+	);
+}
+
 #[tokio::test]
 async fn streamable_http_oversized_body_returns_413_with_configured_limit() {
 	let mock = mock_streamable_http_server(true).await;
@@ -2565,11 +2576,10 @@ async fn streamable_http_oversized_body_returns_413_with_configured_limit() {
 	let resp = mcp_json_post(&client, &url, &body).send().await.unwrap();
 
 	assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+	// The body is the public error envelope with its fixed sentence, not the error's own text, which named the
+	// configured limit (the platform's answers carry nothing internal).
 	let text = resp.text().await.unwrap();
-	assert!(
-		text.contains(&limit.to_string()),
-		"expected configured limit {limit} in body: {text}"
-	);
+	assert_public_payload_too_large(&text);
 }
 
 #[tokio::test]
@@ -2621,11 +2631,10 @@ async fn legacy_sse_post_oversized_body_returns_413_with_configured_limit() {
 	let resp = mcp_json_post(&client, &url, &body).send().await.unwrap();
 
 	assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+	// The body is the public error envelope with its fixed sentence, not the error's own text, which named the
+	// configured limit (the platform's answers carry nothing internal).
 	let text = resp.text().await.unwrap();
-	assert!(
-		text.contains(&limit.to_string()),
-		"expected configured limit {limit} in body: {text}"
-	);
+	assert_public_payload_too_large(&text);
 }
 
 #[tokio::test]
