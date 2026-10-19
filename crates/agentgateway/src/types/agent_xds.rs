@@ -2381,10 +2381,7 @@ fn backend_policy_from_proto(
 		},
 		Some(bps::Kind::BackendTcp(btcp)) => BackendTrafficPolicy::TCP(backend::TCP {
 			connect_timeout: btcp.connect_timeout.map(convert_duration),
-			keepalives: btcp
-				.keepalive
-				.as_ref()
-				.map(types::agent::KeepaliveConfig::from),
+			keepalives: btcp.keepalive.as_ref().map(backend_keepalive),
 		}),
 		Some(bps::Kind::BackendTunnel(bt)) => BackendTrafficPolicy::Tunnel(backend::Tunnel {
 			proxy: Arc::new(resolve_simple_reference(bt.proxy.as_ref())),
@@ -3753,9 +3750,6 @@ impl From<&proto::agent::KeepaliveConfig> for KeepaliveConfig {
 				.unwrap_or_else(types::agent::defaults::keepalive_retries),
 			user_timeout: None,
 		}
-		// A keepalive a policy asks for also bounds how long sent data may stay unacknowledged, to the
-		// time the probes take to declare an idle peer dead.
-		.with_dead_peer_bound()
 	}
 }
 
@@ -3772,6 +3766,14 @@ impl From<&proto::agent::UrlRewrite> for http::filters::UrlRewrite {
 			},
 		}
 	}
+}
+
+/// The keepalive of a backend's TCP policy. It also bounds how long data the proxy sent may stay
+/// unacknowledged, to the time the probes take to declare an idle peer dead (the kernel sends no
+/// probe while data is unacknowledged, so the probes alone never end a connection that is being
+/// written to). A frontend keepalive (the clients') is not given the bound.
+fn backend_keepalive(k: &proto::agent::KeepaliveConfig) -> KeepaliveConfig {
+	KeepaliveConfig::from(k).with_dead_peer_bound()
 }
 
 fn policy_target_from_proto(t: &proto::agent::PolicyTarget) -> Result<PolicyTarget, ProtoError> {
@@ -4308,6 +4310,28 @@ mod tests {
 	use super::*;
 	use crate::store::RequestPolicyTrait;
 	use crate::types::proto::agent::backend_policy_spec::Ai;
+
+	#[test]
+	fn a_keepalive_from_a_policy_also_bounds_how_long_sent_data_may_stay_unacknowledged() {
+		let from_policy = backend_keepalive(&proto::agent::KeepaliveConfig {
+			time: Some(prost_types::Duration {
+				seconds: 5,
+				nanos: 0,
+			}),
+			interval: Some(prost_types::Duration {
+				seconds: 3,
+				nanos: 0,
+			}),
+			retries: Some(3),
+		});
+		assert_eq!(from_policy, KeepaliveConfig::dead_peer());
+		// Left unset, the policy's keepalive takes the long defaults, and its bound with them.
+		let defaults = backend_keepalive(&proto::agent::KeepaliveConfig::default());
+		assert_eq!(defaults.user_timeout, Some(defaults.give_up_after()));
+		// The clients' keepalive (a frontend policy) is not bounded this way.
+		let frontend = KeepaliveConfig::from(&proto::agent::KeepaliveConfig::default());
+		assert_eq!(frontend.user_timeout, None);
+	}
 
 	#[test]
 	fn prompt_guard_scope_from_proto() {

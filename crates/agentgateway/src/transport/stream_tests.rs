@@ -7,16 +7,16 @@
 //! keepalive's own time. A peer whose receive window is shut (`wedged_peer`) is how a test makes
 //! the sender's data stay unsent without dropping packets, which needs privileges a test does not
 //! have: the sender's kernel then probes the window until the user timeout, or forever without it.
+//! Every case takes a few seconds, runs without privileges and needs no real dead peer.
 
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use socket2::{Domain, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use super::*;
 use crate::BackendConfig;
+use crate::test_helpers::wedged_peer;
 
 fn seconds(n: u64) -> Duration {
 	Duration::from_secs(n)
@@ -47,28 +47,6 @@ fn user_timeout_of(socket: &Socket) -> Option<Duration> {
 	socket2::SockRef::from(tcp)
 		.tcp_user_timeout()
 		.expect("the user timeout can be read")
-}
-
-/// A server that accepts one connection and never reads from it. Its receive buffer is the smallest
-/// the kernel allows (the accepted socket inherits it from the listener), so after a few KB the
-/// window it offers is shut: the sender's data stays unsent, and its kernel can only probe the
-/// window, which the peer's kernel keeps answering.
-async fn wedged_peer() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-	let socket = socket2::Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-	socket.set_recv_buffer_size(1).unwrap();
-	socket
-		.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
-		.unwrap();
-	socket.listen(8).unwrap();
-	socket.set_nonblocking(true).unwrap();
-	let listener = TcpListener::from_std(socket.into()).unwrap();
-	let address = listener.local_addr().unwrap();
-	let task = tokio::spawn(async move {
-		let (connection, _) = listener.accept().await.unwrap();
-		std::future::pending::<()>().await;
-		drop(connection);
-	});
-	(address, task)
 }
 
 /// Writes until the connection fails or `within` passes. The result is the error, or None when the
@@ -140,7 +118,8 @@ fn the_bound_is_what_the_probes_take_and_the_dead_peer_keepalive_is_fourteen_sec
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_peer_that_goes_silent_with_data_in_flight_ends_the_connection_at_the_bound() {
-	let (address, _peer) = wedged_peer().await;
+	let peer = wedged_peer().await;
+	let address = peer.address;
 	let mut socket = Socket::dial(
 		address,
 		&config(two_second_keepalive().with_dead_peer_bound()),
@@ -164,12 +143,13 @@ async fn a_peer_that_goes_silent_with_data_in_flight_ends_the_connection_at_the_
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn without_the_bound_a_peer_that_goes_silent_keeps_the_connection_open() {
-	let (address, _peer) = wedged_peer().await;
+	let peer = wedged_peer().await;
+	let address = peer.address;
 	let mut socket = Socket::dial(address, &config(two_second_keepalive()))
 		.await
 		.unwrap();
-	// Three times the time the bound takes.
-	let error = write_until_it_fails(&mut socket, seconds(8)).await;
+	// More than twice the time the bound takes (2 seconds).
+	let error = write_until_it_fails(&mut socket, seconds(5)).await;
 	assert!(error.is_none(), "the connection ended without a bound: {error:?}");
 }
 
@@ -190,9 +170,9 @@ async fn a_peer_that_acknowledges_but_sends_nothing_is_not_cut_at_the_bound() {
 	)
 	.await
 	.unwrap();
-	// Idle for three times the bound: the peer's kernel answers the probes, so the connection is
-	// alive, and a stream that is only waiting (a queue, a slow first token) is not cut.
-	tokio::time::sleep(seconds(6)).await;
+	// Idle for twice the bound: the peer's kernel answers the probes, so the connection is alive,
+	// and a stream that is only waiting (a queue, a slow first token) is not cut.
+	tokio::time::sleep(seconds(4)).await;
 	socket.write_all(b"ping").await.unwrap();
 	let mut echoed = [0u8; 4];
 	socket.read_exact(&mut echoed).await.unwrap();

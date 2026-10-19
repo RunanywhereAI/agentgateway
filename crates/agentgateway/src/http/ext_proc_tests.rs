@@ -33,8 +33,8 @@ use crate::test_helpers::extprocmock::{
 use crate::test_helpers::proxymock::*;
 use crate::test_helpers::{MockInstance, ratelimitmock};
 use crate::types::agent::{
-	BackendTarget, BackendTrafficPolicy, PolicyInheritance, PolicyTarget, SimpleBackendReference,
-	Target, TargetedPolicy,
+	BackendTarget, BackendTrafficPolicy, KeepaliveConfig, PolicyInheritance, PolicyTarget,
+	SimpleBackendReference, Target, TargetedPolicy,
 };
 use crate::types::discovery::{AppProtocol, NamespacedHostname};
 use crate::*;
@@ -2549,6 +2549,14 @@ fn build_ext_proc_request_for_test(
 	ext_proc_addr: std::net::SocketAddr,
 	processing_options: ext_proc::ProcessingOptions,
 ) -> super::ExtProcRequest {
+	build_ext_proc_request_with_policies(ext_proc_addr, processing_options, Vec::new())
+}
+
+fn build_ext_proc_request_with_policies(
+	ext_proc_addr: std::net::SocketAddr,
+	processing_options: ext_proc::ProcessingOptions,
+	policies: Vec<BackendTrafficPolicy>,
+) -> super::ExtProcRequest {
 	let bind = setup_proxy_test("{}").unwrap().with_backend(ext_proc_addr);
 	let client = crate::proxy::httpproxy::PolicyClient::new(bind.inputs());
 	super::ExtProc {
@@ -2556,7 +2564,7 @@ fn build_ext_proc_request_for_test(
 			target: Arc::new(crate::types::agent::SimpleBackendReference::Backend(
 				strng::format!("/{}", ext_proc_addr),
 			)),
-			policies: Vec::new(),
+			policies,
 		},
 		failure_mode: ext_proc::FailureMode::FailClosed,
 		metadata_context: None,
@@ -6055,6 +6063,141 @@ mod body_streaming_and_trailers {
 		// Held until here, so the call can only have ended because the response body was dropped, not
 		// because the policy was.
 		drop(ext_proc_request);
+	}
+
+	// The dead-peer bound of a call to an external processor: a processor that vanished without its
+	// connection closing (a pod killed under the network, a node lost) must end the stream in the
+	// time of the bound, where the kernel's own give-up time is about 15 minutes, and a processor that
+	// is only slow must not be cut. The tests give the call a 2 second bound through a backend TCP
+	// policy (a call with none gets 14 seconds, `KeepaliveConfig::dead_peer`; that wiring is held by
+	// `proxy::httpproxy::tests`), and need no privileges and no real dead peer.
+	fn two_second_bound() -> Vec<BackendTrafficPolicy> {
+		vec![BackendTrafficPolicy::TCP(crate::types::backend::TCP {
+			keepalives: Some(
+				KeepaliveConfig {
+					enabled: true,
+					time: Duration::from_secs(1),
+					interval: Duration::from_secs(1),
+					retries: 1,
+					user_timeout: None,
+				}
+				.with_dead_peer_bound(),
+			),
+			connect_timeout: None,
+		})]
+	}
+
+	struct AnswersBodiesAfter(Duration);
+
+	#[async_trait::async_trait]
+	impl Handler for AnswersBodiesAfter {
+		async fn handle_response_body(
+			&mut self,
+			body: &proto::HttpBody,
+			sender: &mpsc::Sender<Result<proto::ProcessingResponse, tonic::Status>>,
+		) -> Result<(), tonic::Status> {
+			tokio::time::sleep(self.0).await;
+			let _ = sender
+				.send(response_body_response(Some(CommonResponse {
+					body_mutation: Some(BodyMutation {
+						mutation: Some(body_mutation::Mutation::StreamedResponse(
+							proto::StreamedBodyResponse {
+								body: body.body.clone(),
+								end_of_stream: body.end_of_stream,
+							},
+						)),
+					}),
+					..Default::default()
+				})))
+				.await;
+			Ok(())
+		}
+	}
+
+	// A processor that holds its answer for longer than the bound (a queued endpoint picker, a meter
+	// waiting on a slow ledger) still acknowledges every packet: its connection is healthy and the
+	// stream is not cut.
+	#[tokio::test]
+	async fn a_processor_that_is_slow_but_alive_is_not_cut_by_the_dead_peer_bound() {
+		let silence = Duration::from_secs(5);
+		let ext_proc = ExtProcMock::new(move || AnswersBodiesAfter(silence))
+			.spawn()
+			.await;
+		let mut ext_proc_request = build_ext_proc_request_with_policies(
+			ext_proc.address,
+			ext_proc::ProcessingOptions {
+				response_body_mode: ext_proc::BodySendMode::FullDuplexStreamed,
+				..Default::default()
+			},
+			two_second_bound(),
+		);
+		let frames = tokio_stream::iter(vec![Ok::<Frame<bytes::Bytes>, Infallible>(Frame::data(
+			bytes::Bytes::from_static(b"upstream-response"),
+		))]);
+		let mut resp = http::Response::new(Body::new(http_body_util::StreamBody::new(frames)));
+		let _ = ext_proc_request
+			.mutate_response(&mut resp, None)
+			.await
+			.unwrap();
+		let started = std::time::Instant::now();
+		let body = tokio::time::timeout(Duration::from_secs(30), read_body_raw(resp.into_body()))
+			.await
+			.expect("the slow processor's answer must arrive");
+		assert_eq!(body.as_ref(), b"upstream-response");
+		assert!(
+			started.elapsed() >= silence,
+			"the processor answered after {:?}, so the test did not hold the connection silent",
+			started.elapsed()
+		);
+		drop(ext_proc_request);
+	}
+
+	// The case that hung two drills: a processor that has gone silent while the response is streamed
+	// through it. The data the proxy sends it is not read and the processor never answers, so the
+	// call used to stay open until the client cut it. It fails within the bound now, closed: the
+	// request gets the lost-processor answer and nothing of the upstream's response is served
+	// unprocessed. (The same connection failure in the middle of a stream that was answered ends that
+	// stream the way a processor lost cleanly does; see `proxy::httpproxy::tests` for the wiring and
+	// `transport::stream::tests` for the kernel part.)
+	#[tokio::test]
+	async fn a_processor_that_goes_silent_fails_the_call_closed_within_the_dead_peer_bound() {
+		let peer = crate::test_helpers::wedged_peer().await;
+		let mut ext_proc_request = build_ext_proc_request_with_policies(
+			peer.address,
+			ext_proc::ProcessingOptions {
+				response_body_mode: ext_proc::BodySendMode::FullDuplexStreamed,
+				..Default::default()
+			},
+			two_second_bound(),
+		);
+		// An upstream that keeps sending, in chunks past anything the peer's window or the HTTP/2
+		// window of the call can take.
+		let (upstream, upstream_frames) = mpsc::channel::<Result<Frame<bytes::Bytes>, Infallible>>(1);
+		let mut resp = http::Response::new(Body::new(http_body_util::StreamBody::new(
+			tokio_stream::wrappers::ReceiverStream::new(upstream_frames),
+		)));
+		let feeding = tokio::spawn(async move {
+			let chunk = bytes::Bytes::from(vec![b'x'; 32 * 1024]);
+			while upstream.send(Ok(Frame::data(chunk.clone()))).await.is_ok() {}
+		});
+
+		let started = std::time::Instant::now();
+		let outcome = tokio::time::timeout(
+			Duration::from_secs(30),
+			ext_proc_request.mutate_response(&mut resp, None),
+		)
+		.await;
+		let took = started.elapsed();
+		feeding.abort();
+		let outcome = outcome.unwrap_or_else(|_| {
+			panic!("the call to a processor that went silent was still open after {took:?}")
+		});
+		assert!(
+			outcome.is_err(),
+			"the call to a processor that went silent did not fail closed"
+		);
+		drop(ext_proc_request);
+		drop(peer);
 	}
 
 	// The counterpart: a response that was processed to its end is not a client that left. Its call
