@@ -5689,11 +5689,12 @@ mod body_streaming_and_trailers {
 			bytes::Bytes::from_static(b"upstream-response"),
 		))]);
 		let mut resp = http::Response::new(Body::new(http_body_util::StreamBody::new(frames)));
+		// Taken before the call: the body goes to the processor while the call awaits its headers.
+		let started = std::time::Instant::now();
 		let _ = ext_proc_request
 			.mutate_response(&mut resp, None)
 			.await
 			.unwrap();
-		let started = std::time::Instant::now();
 		let body = tokio::time::timeout(Duration::from_secs(30), read_body_raw(resp.into_body()))
 			.await
 			.expect("the slow processor's answer must arrive");
@@ -5727,11 +5728,12 @@ mod body_streaming_and_trailers {
 			bytes::Bytes::from_static(b"upstream-response"),
 		))]);
 		let mut resp = http::Response::new(Body::new(http_body_util::StreamBody::new(frames)));
+		// Taken before the call: the body goes to the processor while the call awaits its headers.
+		let started = std::time::Instant::now();
 		let _ = ext_proc_request
 			.mutate_response(&mut resp, None)
 			.await
 			.unwrap();
-		let started = std::time::Instant::now();
 		let body = tokio::time::timeout(Duration::from_secs(60), read_body_raw(resp.into_body()))
 			.await
 			.expect("the slow processor's answer must arrive");
