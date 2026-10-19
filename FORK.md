@@ -1,7 +1,7 @@
 # RunanywhereAI fork of agentgateway
 
 This branch, `ra/v1.6.0-ra.1`, is upstream tag `v1.6.0`
-(commit ea5608642b9d5c94c5baf5fd9f2f9849b808e963) plus the same changes and their tests as the `v1.5.0` series
+(commit ea5608642b9d5c94c5baf5fd9f2f9849b808e963) plus the same changes and their tests as the `v1.5.0` series, and two that only v1.6.0 needs (changes 6 and 7)
 (`ra/v1.5.0-ra.3`: four changes, and a fifth, the dead-peer bound, that the series gained last; rebased onto `v1.6.0`, see "The
 rebase onto v1.6.0" below). Nothing else differs.
 The `v1.5.0` branches stay as they were: `ra/v1.5.0-ra.3` and its picked-destination-wait follow-ups, `ra/v1.5.0-ra.2`
@@ -125,6 +125,37 @@ without closing), the `dial_config` and `with_dead_peer_keepalive` unit tests, a
 (a live processor silent for longer than the whole 14 seconds is not cut, a wedged one is). The tests that need the user timeout
 are gated to Linux; this code was first compiled on v1.6.0 in Cloud Build.
 
+### 6. The call to the endpoint picker may take 30 seconds (v1.6.0 only)
+
+v1.6.0 gives every policy call that has no timeout of its own a 10 second fallback for the response headers (upstream
+#3426, `internal_call_with_policies` and `simple_call` in `proxy/httpproxy.rs`; v1.5.0 has none). The endpoint picker is
+such a call: it holds a request in its queue until its class deadline (10 s by default, 20 s at most, ADR 0041) and, as a gRPC
+server, sends the response headers with its first message. The proxy cut the call at 10 s, and the client got a 500 where the
+picker would have refused it with its 429 or 503 and a Retry-After. No policy can set this timeout (a Service policy attaches
+only to a route's backend, and the picker is not one), so `InferenceRouting::build` (`http/ext_proc.rs`) gives the call its own
+backend policy with `request_timeout` 30 s, `PICKER_CALL_TIMEOUT`: the longest deadline plus a margin. If a deadline is ever
+raised past 20 s, raise it with it. Upstream main (203 commits past v1.6.0) has no fix or knob for this call: the fallback and
+`policies: Vec::new()` are unchanged there. The dead-peer bound (change 5) is separate and does not interplay: it is a TCP
+user timeout and keepalive on the socket, which a queued picker's healthy connection answers.
+
+Tests (`http::ext_proc::tests::picker_call`): a picker whose call is held open for 12 s is not cut and its choice is used; one
+silent beyond 30 s is cut at 30 s and the request fails closed with a 500. The mock holds the call open before it returns
+(`on_open`), because a mock that returns at once sends the headers at once and was never cut by the 10 s fallback.
+
+### 7. The reason of an answer a response policy replaces stays the upstream's (v1.6.0 only)
+
+`requests_total{reason}` says who made an answer; `Upstream` is an engine's own, and the pool release controller counts a pool's
+responses with `reason="Upstream"`. The stream meter replaces an engine's 5xx with its own ImmediateResponse in the response
+phase. v1.5.0 never changed the reason after the response policies ran; v1.6.0 resolves a response policy's failure through
+`resolve_response`, which sets it from the failure (`DirectResponse`), so a pool whose engines answer 5xx dropped out of the
+count. `HTTPProxy::proxy` now keeps `Upstream` when the answer a response policy replaces is one the upstream sent and the
+replacement is a direct response. An error the proxy made itself (a processor that failed, a transformation that errored) keeps
+its own reason, and so does a request-phase ImmediateResponse, which is made before any upstream answer.
+
+Tests (`http::ext_proc::tests::reason_of_a_replaced_answer`): an engine's 500 replaced by a response-phase ImmediateResponse is
+counted `Upstream`; a request-phase ImmediateResponse is `DirectResponse`; a processor that fails in the response phase is
+`ExtProc`. The harness keeps its metrics registry (`TestBind::metrics_text`) so a test can read what the proxy counted.
+
 ## Why
 
 Behind this gateway an inference engine keeps generating for a client that has gone, and the metering
@@ -190,7 +221,9 @@ redundant on `v1.6.0`. The map from each original commit to its rebased one is k
   passes. They are not ours and are not changed.
 - Behaviour of v1.6.0 that a consumer should know and this branch does not change: the external authorization call has a
   default timeout of 2 seconds, and (the release notes' words) rate limit and external processing calls default to 10
-  seconds; a failure to get a credential from a provider is 502 where it was 500.
+  seconds (the endpoint picker's call is the exception this branch makes, change 6; the stream meter answers its headers at
+  once; a processor that is silent for longer than 10 s before its first message would be cut, and none of the platform's is);
+  a failure to get a credential from a provider is 502 where it was 500.
 - Build: v1.6.0's own `rust-toolchain.toml` names Rust 1.99.0 (its Dockerfile uses `rust:1.99.0-trixie`); the code needs
   only `rust-version = 1.90`, and the crates type-check, test targets included, with Rust 1.98.1.
 
