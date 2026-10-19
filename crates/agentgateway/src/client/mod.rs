@@ -310,7 +310,10 @@ struct Connector {
 /// sends no probe while sent data is unacknowledged, so the probes alone never end a connection that is
 /// being written to. This is the one place a policy's keepalive is applied, so a policy from a config
 /// file and one from the control plane are bounded alike.
-fn dial_config(base: &crate::BackendConfig, tcp: Option<&types::backend::TCP>) -> crate::BackendConfig {
+fn dial_config(
+	base: &crate::BackendConfig,
+	tcp: Option<&types::backend::TCP>,
+) -> crate::BackendConfig {
 	let mut config = base.clone();
 	if let Some(tcp) = tcp {
 		if let Some(connect_timeout) = tcp.connect_timeout {
@@ -857,10 +860,16 @@ mod tests {
 		};
 		let config = dial_config(&base, Some(&policy(Some(named))));
 		assert_eq!(config.keepalives, KeepaliveConfig::dead_peer());
-		assert_eq!(config.keepalives.user_timeout, Some(std::time::Duration::from_secs(14)));
+		assert_eq!(
+			config.keepalives.user_timeout,
+			Some(std::time::Duration::from_secs(14))
+		);
 		// The long defaults of a policy that names none of the numbers: bounded by the time its probes take.
 		let long = dial_config(&base, Some(&policy(Some(KeepaliveConfig::default()))));
-		assert_eq!(long.keepalives.user_timeout, Some(long.keepalives.give_up_after()));
+		assert_eq!(
+			long.keepalives.user_timeout,
+			Some(long.keepalives.give_up_after())
+		);
 	}
 
 	#[test]

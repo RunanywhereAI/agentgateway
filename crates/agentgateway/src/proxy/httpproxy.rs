@@ -4292,7 +4292,10 @@ mod tests {
 		with_dead_peer_keepalive(&mut policies);
 		let keepalives = policies.tcp.unwrap().keepalives.unwrap();
 		assert_eq!(keepalives, KeepaliveConfig::dead_peer());
-		assert_eq!(keepalives.user_timeout, Some(std::time::Duration::from_secs(14)));
+		assert_eq!(
+			keepalives.user_timeout,
+			Some(std::time::Duration::from_secs(14))
+		);
 	}
 
 	#[test]
