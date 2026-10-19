@@ -5738,6 +5738,77 @@ mod body_streaming_and_trailers {
 		drop(peer);
 	}
 
+	/// The TCP user timeout of each socket of this process that is connected to `peer`.
+	#[cfg(target_os = "linux")]
+	fn user_timeouts_of_sockets_to(peer: SocketAddr) -> Vec<Option<Duration>> {
+		use std::os::fd::{BorrowedFd, RawFd};
+
+		let mut found = Vec::new();
+		for entry in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
+			let Ok(fd) = entry.file_name().to_string_lossy().parse::<RawFd>() else {
+				continue;
+			};
+			// SAFETY: the descriptor is only borrowed for these calls; one closed meanwhile makes them fail,
+			// and the socket is skipped.
+			let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+			let socket = socket2::SockRef::from(&borrowed);
+			if socket.peer_addr().ok().and_then(|address| address.as_socket()) == Some(peer) {
+				found.push(socket.tcp_user_timeout().unwrap_or(None));
+			}
+		}
+		found
+	}
+
+	// The wiring, on the real socket: the call to an external processor is given the 14 second bound of
+	// `KeepaliveConfig::dead_peer` when no policy names a keepalive, and a keepalive a policy names is
+	// used with its own bound.
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn the_call_to_a_processor_gets_the_default_dead_peer_bound_unless_a_policy_sets_another() {
+		let without_policy = crate::test_helpers::wedged_peer().await;
+		let with_policy = crate::test_helpers::wedged_peer().await;
+		let options = || ext_proc::ProcessingOptions {
+			response_body_mode: ext_proc::BodySendMode::FullDuplexStreamed,
+			..Default::default()
+		};
+		let mut calls = Vec::new();
+		for (peer, policies) in [
+			(without_policy.address, Vec::new()),
+			(with_policy.address, two_second_bound()),
+		] {
+			let mut ext_proc_request = build_ext_proc_request_with_policies(peer, options(), policies);
+			let (upstream, upstream_frames) =
+				mpsc::channel::<Result<Frame<bytes::Bytes>, Infallible>>(1);
+			let mut resp = http::Response::new(Body::new(http_body_util::StreamBody::new(
+				tokio_stream::wrappers::ReceiverStream::new(upstream_frames),
+			)));
+			calls.push(tokio::spawn(async move {
+				let _upstream = upstream;
+				let _ = ext_proc_request.mutate_response(&mut resp, None).await;
+			}));
+		}
+		let mut seen = (Vec::new(), Vec::new());
+		tokio::time::timeout(Duration::from_secs(10), async {
+			loop {
+				seen = (
+					user_timeouts_of_sockets_to(without_policy.address),
+					user_timeouts_of_sockets_to(with_policy.address),
+				);
+				if !seen.0.is_empty() && !seen.1.is_empty() {
+					break;
+				}
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
+		})
+		.await
+		.expect("both calls must connect to their processor");
+		for call in calls {
+			call.abort();
+		}
+		assert_eq!(seen.0, vec![Some(Duration::from_secs(14))]);
+		assert_eq!(seen.1, vec![Some(Duration::from_secs(2))]);
+	}
+
 	// The counterpart: a response that was processed to its end is not a client that left. Its call
 	// finishes cleanly, as it does without the cancellation, and the server sees no failure.
 	#[tokio::test]
