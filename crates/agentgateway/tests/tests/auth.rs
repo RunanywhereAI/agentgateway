@@ -285,7 +285,10 @@ async fn gateway_phase_authorization_runs_before_route_selection() {
 
 	let denied = send_request(io.clone(), Method::GET, "http://lo/no-route-needed").await;
 	assert_eq!(denied.status(), 403);
-	assert_eq!(read_body!(denied).as_ref(), b"authorization failed");
+	// The public sentence of a 403, never the error's text.
+	let denied_body: serde_json::Value = serde_json::from_slice(read_body!(denied).as_ref()).unwrap();
+	assert_eq!(denied_body["error"]["type"], "permission_error");
+	assert!(denied_body["error"]["code"].is_null());
 
 	let allowed = send_request_headers(
 		io,

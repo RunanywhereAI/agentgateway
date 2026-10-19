@@ -326,13 +326,20 @@ impl ExtAuthz {
 				);
 				Ok(PolicyResponse::default())
 			},
-			FailureMode::Deny => Err(ProxyError::ExternalAuthorizationFailed(None)),
+			FailureMode::Deny => {
+				tracing::debug!(error = error_msg, "ext_authz unavailable: failing closed");
+				Err(ProxyError::ExternalAuthorizationUnavailable)
+			},
 			FailureMode::DenyWithStatus(status_code) => {
 				let status = StatusCode::from_u16(*status_code).unwrap_or(StatusCode::FORBIDDEN);
-				let resp = ::http::Response::builder()
-					.status(status)
-					.body(http::Body::from(error_msg.to_string()))
-					.map_err(|e| ProxyError::Processing(e.into()))?;
+				// The reason stays in the log: the client is told the public sentence of the status, never the
+				// text of the failure (which can name the authorization service).
+				tracing::debug!(
+					error = error_msg,
+					"ext_authz unavailable: failing closed with a status"
+				);
+				let resp =
+					crate::proxy::public_error::PublicError::of_status(status).into_direct_response();
 				Ok(PolicyResponse {
 					direct_response: Some(resp),
 					response_headers: None,

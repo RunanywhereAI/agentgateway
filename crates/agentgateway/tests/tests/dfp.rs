@@ -99,10 +99,10 @@ async fn dfp_rejects_inference_routing() {
 	let res = send_request(io, Method::GET, "http://example.com/dynamic").await;
 	assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
 	let body = res.into_body().collect().await.unwrap().to_bytes();
-	assert_eq!(
-		String::from_utf8_lossy(&body),
-		"processing failed: inferenceRouting is not supported with dynamic backends"
-	);
+	// The public sentence, not the text of the failure.
+	let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(body["error"]["code"], "gateway_unavailable");
+	assert!(!body.to_string().contains("inferenceRouting"));
 }
 
 /// DFP resolves the destination from the request's Host/URI authority, including the port.

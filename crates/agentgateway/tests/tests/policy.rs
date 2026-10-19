@@ -29,11 +29,47 @@ async fn response_policy_short_circuit() {
 		.await;
 
 	let res = send_request(io.clone(), Method::GET, "http://lo/p").await;
-	assert_eq!(res.status(), 403);
+	// The authorization service gave no answer and the policy fails closed: the client is told the
+	// service is unavailable (the public `credit_gate_unavailable`), not that it is not entitled.
+	assert_eq!(res.status(), 503);
 	// Each type of response modifier should NOT run since the ext_authz short-circuits the req
 	assert_eq!(res.hdr("x-filter"), "");
 	assert_eq!(res.hdr("x-xfm"), "");
-	assert_eq!(read_body!(res).as_ref(), b"external authorization failed");
+	assert_eq!(res.hdr("content-type"), "application/json");
+	assert_eq!(res.hdr("retry-after"), "10");
+	let body: serde_json::Value = serde_json::from_slice(read_body!(res).as_ref()).unwrap();
+	assert_eq!(body["error"]["code"], "credit_gate_unavailable");
+	assert_eq!(body["error"]["type"], "server_error");
+	assert!(!body.to_string().contains("127.0.0.1"));
+}
+
+#[tokio::test]
+async fn an_error_the_proxy_makes_on_a_messages_path_is_the_messages_envelope() {
+	let (_mock, mut bind, io) = basic_setup().await;
+	bind
+		.attach_route(json!({
+			"policies": {
+				"extAuthz": {
+					// Dummy host that should fail
+					"host": "127.0.0.1:1",
+				},
+			},
+		}))
+		.await;
+
+	let res = send_request(io.clone(), Method::POST, "http://lo/v1/messages").await;
+	assert_eq!(res.status(), 503);
+	assert_eq!(res.hdr("content-type"), "application/json");
+	assert_eq!(res.hdr("retry-after"), "10");
+	let body: serde_json::Value = serde_json::from_slice(read_body!(res).as_ref()).unwrap();
+	assert_eq!(body["type"], "error");
+	assert_eq!(body["error"]["type"], "api_error");
+	assert_eq!(body["request_id"], "unknown");
+
+	let res = send_request(io, Method::POST, "http://lo/v1/chat/completions").await;
+	let body: serde_json::Value = serde_json::from_slice(read_body!(res).as_ref()).unwrap();
+	assert!(body.get("type").is_none());
+	assert_eq!(body["error"]["code"], "credit_gate_unavailable");
 }
 
 #[tokio::test]

@@ -3,6 +3,7 @@ pub mod dtrace;
 mod gateway;
 pub mod httpproxy;
 pub mod proxy_protocol;
+pub mod public_error;
 pub mod request_builder;
 pub mod tcpproxy;
 
@@ -84,7 +85,9 @@ impl ProxyError {
 			ProxyError::McpJwtAuthenticationFailure(_, _) => ProxyResponseReason::JwtAuth,
 			ProxyError::BasicAuthenticationFailure(_) => ProxyResponseReason::BasicAuth,
 			ProxyError::APIKeyAuthenticationFailure(_) => ProxyResponseReason::APIKeyAuth,
-			ProxyError::ExternalAuthorizationFailed(_) => ProxyResponseReason::ExtAuth,
+			ProxyError::ExternalAuthorizationFailed(_) | ProxyError::ExternalAuthorizationUnavailable => {
+				ProxyResponseReason::ExtAuth
+			},
 			ProxyError::MCP(mcp::Error::RateLimited { .. }) => ProxyResponseReason::RateLimit,
 			ProxyError::MCP(_) => ProxyResponseReason::MCP,
 			ProxyError::AuthorizationFailed
@@ -208,6 +211,10 @@ pub enum ProxyError {
 	NoHealthyEndpoints,
 	#[error("external authorization failed")]
 	ExternalAuthorizationFailed(Option<StatusCode>),
+	/// The external authorization service gave no answer (it was unreachable, timed out or failed), and the
+	/// policy fails closed. Not the same as a refusal: the caller is not told it is not entitled.
+	#[error("external authorization unavailable")]
+	ExternalAuthorizationUnavailable,
 	#[error("authorization failed")]
 	AuthorizationFailed,
 	#[error("backend authentication failed: {0}")]
@@ -365,6 +372,10 @@ impl ProxyError {
 			_ => false,
 		}
 	}
+	/// The response for this error. For an HTTP client it is the public error envelope with fixed words
+	/// (`public_error`), never the error's own text, which can name a host, a pod or an internal failure; a
+	/// gRPC client gets the same words in `grpc-message`. Only an error that is not an HTTP error status (an MCP
+	/// case) keeps its text.
 	pub fn into_response_with_grpc(self, is_grpc_request: bool) -> Response {
 		let msg = self.to_string();
 		let code = match self {
@@ -422,6 +433,7 @@ impl ProxyError {
 			ProxyError::SubstrateEgressDenied(_) => StatusCode::FORBIDDEN,
 			ProxyError::SubstrateEgressUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
 			ProxyError::ExternalAuthorizationFailed(status) => status.unwrap_or(StatusCode::FORBIDDEN),
+			ProxyError::ExternalAuthorizationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
 
 			ProxyError::DnsResolution => StatusCode::SERVICE_UNAVAILABLE,
 			ProxyError::NoHealthyEndpoints => StatusCode::SERVICE_UNAVAILABLE,
@@ -494,6 +506,10 @@ impl ProxyError {
 			ProxyError::MCP(mcp::Error::RateLimited { .. }) => StatusCode::OK,
 		};
 		let grpc_status = is_grpc_request.then(|| proxy_error_to_grpc_status(&self, code));
+		// The words of the answer: an error status gets the public sentence; anything else (an MCP case that
+		// is not an error status) keeps the error's text.
+		let public = (code.is_client_error() || code.is_server_error())
+			.then(|| public_error::PublicError::of_proxy_error(&self, code));
 		let mut rb = ::http::Response::builder().status(code);
 
 		// Apply per-error headers
@@ -534,7 +550,14 @@ impl ProxyError {
 				.header("grpc-status", i32::from(grpc_status).to_string())
 				.header(
 					"grpc-message",
-					utf8_percent_encode(&msg, GRPC_MESSAGE_ENCODE_SET).to_string(),
+					utf8_percent_encode(
+						public
+							.as_ref()
+							.map(public_error::PublicError::message)
+							.unwrap_or(msg.as_str()),
+						GRPC_MESSAGE_ENCODE_SET,
+					)
+					.to_string(),
 				)
 				.body(http::Body::empty())
 				.unwrap();
@@ -578,6 +601,9 @@ impl ProxyError {
 				.unwrap();
 		}
 
+		if let Some(public) = public {
+			return public.into_response(rb);
+		}
 		rb.header(hyper::header::CONTENT_TYPE, "text/plain")
 			.body(http::Body::from(msg))
 			.unwrap()
@@ -855,7 +881,8 @@ mod tests {
 		);
 		assert_eq!(
 			response.headers().get("grpc-message").unwrap(),
-			"no%20healthy%20backends"
+			// The public sentence, never the error's own text (`no healthy backends`).
+			"The%20model%20is%20starting%20and%20is%20not%20ready."
 		);
 	}
 
@@ -866,7 +893,11 @@ mod tests {
 		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 		assert_eq!(
 			response.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
-			"text/plain"
+			"application/json"
+		);
+		assert_eq!(
+			response.headers().get(hyper::header::RETRY_AFTER).unwrap(),
+			"30"
 		);
 		assert!(response.headers().get("grpc-status").is_none());
 	}

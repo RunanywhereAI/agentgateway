@@ -1,8 +1,9 @@
 # RunanywhereAI fork of agentgateway
 
-This branch, `ra/v1.5.0-ra.2`, is upstream tag `v1.5.0`
-(commit fe6732474a96a0363dfb9822859af4e9bab360fa) plus two changes and their tests. Nothing else differs.
-The earlier branch `ra/v1.5.0-client-leave` carries the first change only (the build `v1.5.0-ra.1`).
+This branch, `ra/v1.5.0-ra.3`, is upstream tag `v1.5.0`
+(commit fe6732474a96a0363dfb9822859af4e9bab360fa) plus three changes and their tests. Nothing else differs.
+The branch `ra/v1.5.0-ra.2` carries the first two (the build `v1.5.0-ra.2`), and `ra/v1.5.0-client-leave` the first
+only (the build `v1.5.0-ra.1`).
 
 ## What it carries
 
@@ -48,6 +49,42 @@ A value that is accepted is converted exactly as before.
 Files: `crates/celx/src/general.rs` (the fix), `crates/celx/src/function_tests.rs` (six unit tests whose names
 start `json_field_`) and the new `crates/celx/tests/json_field_memory.rs` (a counting global allocator
 measures the peak while `jsonField` reads `model` from a crafted 8 MiB body; it must stay under twice the body).
+
+### 3. The proxy's own errors are the platform's public error envelope
+
+Every error answer the proxy made itself was the error's Display text as `text/plain` (`upstream call failed: ...`
+with the upstream's address, `ext_proc failed: ...`, `no healthy backends`), and an external processor's refusal
+(the endpoint picker's `inference error: ServiceUnavailable - ... no endpoints are available ...`) reached the client
+as the processor's own sentence with no content type. A client of the platform reads the OpenAI error object
+`{"error":{"message","type","code","param"}}` (or the Messages error object on the Messages paths), and nothing
+internal may reach it. The new module `proxy/public_error.rs` is the one place that writes such a body:
+
+- `ProxyError::into_response_with_grpc` answers an HTTP error status with the envelope and a sentence of a closed
+  table (the same words `dialect-errors.json` of the consumer gives each code), chosen by the error and its status;
+  `grpc-message` carries the same sentence. The status is unchanged, except as below. A 503 carries `Retry-After`
+  (10 s; 30 s with no healthy backend, code `cold`; 5 s when the proxy sheds a request at its in-flight limit).
+- A new error `ExternalAuthorizationUnavailable`: the external authorization call got no answer and the policy fails
+  closed. It was a 403 ("external authorization failed"), which tells the caller it is not entitled. It is now the 503
+  `credit_gate_unavailable` with `Retry-After: 10`, the answer admission itself gives when its own authorize fails.
+  Its metrics reason stays `ExtAuth`. A refusal the service sent without a response is still `ExternalAuthorizationFailed`
+  (403, no code).
+- `to_immediate_response` (an external processor answering the request itself) wraps an error answer that is not JSON
+  (no JSON content type and a body that is not one JSON object) in the envelope: a 429 is `capacity_exceeded`
+  (`Retry-After: 12`), a 503 is `cold` (`Retry-After: 30`; `draining` when the picker says it is shutting down), any other
+  status gets the sentence of its status. The picker's own `x-llm-d-*` and `x-gateway-*` headers are dropped, and a
+  `Retry-After` the processor sent is kept. A JSON answer (admission's and the meter's) is not touched, byte for byte.
+- The body is written in the OpenAI form where the error is made. `finish` runs at the end of the request, after the
+  response policies, and for a Messages path (`/v1/messages`, `/v1/messages/count_tokens`, bare or under `/pools/<pool>`;
+  the rule of the consumer's pre-routing policy) writes the Messages form again, with the `x-request-id` the response
+  policy set (`unknown` when there is none).
+
+Not changed: protocol-level answers hyper writes before the proxy sees a request, the MCP and LLM provider error shapes,
+`RemoteRateLimitExceeded` and guardrail rejections (a service's own response), the CSRF policy's 403, and the LLM `Models`
+route's 501: the consumer's edge uses none of them.
+
+Files: `crates/agentgateway/src/proxy/public_error.rs` (new, with `public_error_tests.rs`), `proxy/mod.rs`,
+`proxy/httpproxy.rs`, `proxy/gateway.rs`, `http/ext_proc/mutation.rs`, `http/ext_authz.rs`, and the tests that asserted the old
+text (`http/ext_proc_tests.rs`, `tests/tests/policy.rs`, `auth.rs`, `dfp.rs`).
 
 ## Why
 
