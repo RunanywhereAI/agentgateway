@@ -5690,13 +5690,93 @@ mod body_streaming_and_trailers {
 		drop(ext_proc_request);
 	}
 
-	// The case that hung two drills: a processor that has gone silent while the response is streamed
-	// through it. The data the proxy sends it is not read and the processor never answers, so the
-	// call used to stay open until the client cut it. It fails within the bound now, closed: the
-	// request gets the lost-processor answer and nothing of the upstream's response is served
-	// unprocessed. (The same connection failure in the middle of a stream that was answered ends that
-	// stream the way a processor lost cleanly does; see `proxy::httpproxy::tests` for the wiring and
-	// `transport::stream::tests` for the kernel part.)
+	/// The mock's own defaults: every body chunk comes straight back as the processed chunk.
+	struct EchoBodies;
+
+	#[async_trait::async_trait]
+	impl Handler for EchoBodies {}
+
+	// The case that hung two drills, in the middle of a stream: a processor that answered, and then
+	// went silent while the response was streamed through it. The relay in front of the processor stops
+	// reading mid-stream and keeps the connection open, so what the proxy sends stays unsent in its
+	// kernel. The response stream used to stay open until the client cut it; it ends within the bound
+	// now, and the upstream is released with it. The same case on a connection whose packets are
+	// dropped (the real dead peer) ends at the default 14 seconds, shown on an Azure test VM.
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn a_processor_that_goes_silent_mid_stream_ends_the_response_within_the_dead_peer_bound() {
+		let ext_proc = ExtProcMock::new(|| EchoBodies).spawn().await;
+		let wedge = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let relay = crate::test_helpers::wedgeable_relay(ext_proc.address, wedge.clone()).await;
+		let mut ext_proc_request = build_ext_proc_request_with_policies(
+			relay.address,
+			ext_proc::ProcessingOptions {
+				response_body_mode: ext_proc::BodySendMode::FullDuplexStreamed,
+				..Default::default()
+			},
+			two_second_bound(),
+		);
+		let (upstream, upstream_frames) = mpsc::channel::<Result<Frame<bytes::Bytes>, Infallible>>(1);
+		let mut resp = http::Response::new(Body::new(http_body_util::StreamBody::new(
+			tokio_stream::wrappers::ReceiverStream::new(upstream_frames),
+		)));
+		let _ = ext_proc_request
+			.mutate_response(&mut resp, None)
+			.await
+			.unwrap();
+		let mut body = resp.into_body();
+
+		// The stream is up and answering: a chunk goes through the processor and comes back.
+		upstream
+			.send(Ok(Frame::data(bytes::Bytes::from_static(b"first"))))
+			.await
+			.unwrap();
+		let first = tokio::time::timeout(
+			Duration::from_secs(10),
+			http_body_util::BodyExt::frame(&mut body),
+		)
+		.await
+		.expect("the first chunk must come back through the processor")
+		.expect("the body has a first frame")
+		.expect("the first frame is not an error");
+		assert_eq!(first.into_data().ok().as_deref(), Some(&b"first"[..]));
+
+		// The processor goes silent while the upstream keeps sending.
+		wedge.store(true, std::sync::atomic::Ordering::SeqCst);
+		let feeding = tokio::spawn(async move {
+			let chunk = bytes::Bytes::from(vec![b'x'; 32 * 1024]);
+			while upstream.send(Ok(Frame::data(chunk.clone()))).await.is_ok() {}
+		});
+		let started = std::time::Instant::now();
+		let ended = tokio::time::timeout(Duration::from_secs(30), async {
+			loop {
+				match http_body_util::BodyExt::frame(&mut body).await {
+					None | Some(Err(_)) => break,
+					Some(Ok(_)) => {},
+				}
+			}
+		})
+		.await;
+		let took = started.elapsed();
+		assert!(
+			ended.is_ok(),
+			"the response of a processor that went silent was still open after {took:?}"
+		);
+		// The client is gone with its response, and the upstream is released by it, with no help.
+		drop(body);
+		drop(ext_proc_request);
+		tokio::time::timeout(Duration::from_secs(10), feeding)
+			.await
+			.expect("the upstream must be released once the response has ended")
+			.unwrap();
+		drop(relay);
+	}
+
+	// The case that hung two drills, before the response: a processor that has gone silent before it
+	// answered. The data the proxy sends it is not read and the processor never answers, so the call
+	// used to stay open until the client cut it. It fails within the bound now, closed: the request
+	// gets the lost-processor answer and nothing of the upstream's response is served unprocessed.
+	#[cfg(target_os = "linux")]
 	#[tokio::test]
 	async fn a_processor_that_goes_silent_fails_the_call_closed_within_the_dead_peer_bound() {
 		let peer = crate::test_helpers::wedged_peer().await;

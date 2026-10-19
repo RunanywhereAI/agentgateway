@@ -10,7 +10,9 @@ pub mod proxymock;
 pub mod ratelimitmock;
 pub use common::MockInstance;
 #[cfg(test)]
-pub(crate) use common::{spawn_service, wedged_peer};
+pub(crate) use common::spawn_service;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use common::{wedgeable_relay, wedged_peer};
 #[cfg(any(test, feature = "internal_benches"))]
 pub use policy::{policy_client, test_policy};
 
@@ -74,7 +76,7 @@ mod common {
 	/// unsent in its own kernel, and the sender's kernel can only probe the window, which the peer's
 	/// kernel keeps answering. It is how a test makes a connection that has data to send and no
 	/// progress, without dropping packets (which needs privileges a test does not have).
-	#[cfg(test)]
+	#[cfg(all(test, target_os = "linux"))]
 	pub async fn wedged_peer() -> MockInstance {
 		use socket2::{Domain, Socket, Type};
 
@@ -91,6 +93,70 @@ mod common {
 			let (connection, _) = listener.accept().await.unwrap();
 			std::future::pending::<()>().await;
 			drop(connection);
+		});
+		MockInstance { address, handle }
+	}
+
+	/// A TCP relay in front of `target` that can be wedged in the middle of a connection. It relays one
+	/// connection both ways, with the smallest receive buffer the kernel allows on the side the caller
+	/// connects to. Once `wedge` is set it stops reading from that side and stops relaying, but keeps
+	/// the connection open and acknowledging probes: what the caller sends from then on stays unsent in
+	/// its own kernel (`wedged_peer`'s case, but for a connection that was healthy until then).
+	#[cfg(all(test, target_os = "linux"))]
+	pub async fn wedgeable_relay(
+		target: SocketAddr,
+		wedge: std::sync::Arc<std::sync::atomic::AtomicBool>,
+	) -> MockInstance {
+		use std::sync::atomic::Ordering;
+
+		use socket2::{Domain, Socket, Type};
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+		socket.set_recv_buffer_size(1).unwrap();
+		socket
+			.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+			.unwrap();
+		socket.listen(8).unwrap();
+		socket.set_nonblocking(true).unwrap();
+		let listener = tokio::net::TcpListener::from_std(socket.into()).unwrap();
+		let address = listener.local_addr().unwrap();
+		let handle = tokio::spawn(async move {
+			let (caller, _) = listener.accept().await.unwrap();
+			let upstream = tokio::net::TcpStream::connect(target).await.unwrap();
+			let (mut caller_read, mut caller_write) = caller.into_split();
+			let (mut upstream_read, mut upstream_write) = upstream.into_split();
+			let wedged = wedge.clone();
+			let forward = tokio::spawn(async move {
+				let mut buffer = [0u8; 4096];
+				loop {
+					let n = match caller_read.read(&mut buffer).await {
+						Ok(0) | Err(_) => return,
+						Ok(n) => n,
+					};
+					if wedged.load(Ordering::SeqCst) {
+						// Reading stops here and the connection stays open.
+						std::future::pending::<()>().await;
+					}
+					if upstream_write.write_all(&buffer[..n]).await.is_err() {
+						return;
+					}
+				}
+			});
+			let mut buffer = [0u8; 4096];
+			loop {
+				let n = match upstream_read.read(&mut buffer).await {
+					Ok(0) | Err(_) => break,
+					Ok(n) => n,
+				};
+				if wedge.load(Ordering::SeqCst) {
+					std::future::pending::<()>().await;
+				}
+				if caller_write.write_all(&buffer[..n]).await.is_err() {
+					break;
+				}
+			}
+			forward.abort();
 		});
 		MockInstance { address, handle }
 	}

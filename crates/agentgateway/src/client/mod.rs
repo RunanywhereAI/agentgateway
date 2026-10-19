@@ -296,6 +296,25 @@ struct Connector {
 	resolver: Arc<dns::CachedResolver>,
 }
 
+/// The settings of one upstream TCP dial: the proxy's own, with the connect timeout and the keepalive a
+/// backend policy names laid over them. A keepalive a policy names also bounds how long data the proxy
+/// sent may stay unacknowledged, to the time the probes take to declare an idle peer dead: the kernel
+/// sends no probe while sent data is unacknowledged, so the probes alone never end a connection that is
+/// being written to. This is the one place a policy's keepalive is applied, so a policy from a config
+/// file and one from the control plane are bounded alike.
+fn dial_config(base: &crate::BackendConfig, tcp: Option<&types::backend::TCP>) -> crate::BackendConfig {
+	let mut config = base.clone();
+	if let Some(tcp) = tcp {
+		if let Some(connect_timeout) = tcp.connect_timeout {
+			config.connect_timeout = connect_timeout;
+		}
+		if let Some(keepalives) = tcp.keepalives.as_ref() {
+			config.keepalives = keepalives.clone().with_dead_peer_bound();
+		}
+	}
+	config
+}
+
 async fn dial(
 	target: &Target,
 	ep: SocketAddr,
@@ -329,15 +348,7 @@ impl Connector {
 		trace!(?transport, "connecting");
 		let stream = match transport {
 			Transport::Plain(_) => {
-				let mut backend_config = (*self.backend_config).clone();
-				if let Some(tcp) = tcp.as_ref() {
-					if let Some(connect_timeout) = tcp.connect_timeout {
-						backend_config.connect_timeout = connect_timeout;
-					}
-					if let Some(keepalives) = tcp.keepalives.as_ref() {
-						backend_config.keepalives = keepalives.clone();
-					}
-				}
+				let backend_config = dial_config(&self.backend_config, tcp.as_ref());
 				dial(&target, ep, &backend_config).await?
 			},
 			Transport::Tunnel(_, tcfg) if tcfg.connect || tls.is_some() || !http => {
@@ -778,6 +789,37 @@ impl Client {
 mod tests {
 	use super::*;
 	use crate::types::agent::TunnelProtocol;
+
+	#[test]
+	fn a_keepalive_a_policy_names_also_bounds_how_long_sent_data_may_stay_unacknowledged() {
+		use crate::types::agent::KeepaliveConfig;
+
+		let base = crate::BackendConfig::default();
+		let policy = |keepalives| types::backend::TCP {
+			keepalives,
+			connect_timeout: Some(std::time::Duration::from_secs(3)),
+		};
+		// No policy, or one with no keepalive: the proxy's own keepalive and no user timeout.
+		assert_eq!(dial_config(&base, None).keepalives, base.keepalives);
+		assert_eq!(dial_config(&base, None).keepalives.user_timeout, None);
+		let without = dial_config(&base, Some(&policy(None)));
+		assert_eq!(without.keepalives.user_timeout, None);
+		assert_eq!(without.connect_timeout, std::time::Duration::from_secs(3));
+		// A keepalive a policy names, as the control plane or a config file wrote it (no user timeout of its own).
+		let named = KeepaliveConfig {
+			enabled: true,
+			time: std::time::Duration::from_secs(5),
+			interval: std::time::Duration::from_secs(3),
+			retries: 3,
+			user_timeout: None,
+		};
+		let config = dial_config(&base, Some(&policy(Some(named))));
+		assert_eq!(config.keepalives, KeepaliveConfig::dead_peer());
+		assert_eq!(config.keepalives.user_timeout, Some(std::time::Duration::from_secs(14)));
+		// The long defaults of a policy that names none of the numbers: bounded by the time its probes take.
+		let long = dial_config(&base, Some(&policy(Some(KeepaliveConfig::default()))));
+		assert_eq!(long.keepalives.user_timeout, Some(long.keepalives.give_up_after()));
+	}
 
 	#[test]
 	fn waypoint_bind_renders_as_waypoint() {
