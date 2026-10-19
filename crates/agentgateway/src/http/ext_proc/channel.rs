@@ -73,7 +73,7 @@ impl tower::Service<::http::Request<tonic::body::Body>> for AbortableChannel {
 		// connection closing must end the stream in seconds (see `with_dead_peer_keepalive`).
 		Box::pin(async move {
 			client
-				.call_ext_proc_with_policies_untraced(req, &target, policies.as_slice())
+				.call_reference_with_policies_untraced(req, &target, policies.as_slice())
 				.await
 		})
 	}
