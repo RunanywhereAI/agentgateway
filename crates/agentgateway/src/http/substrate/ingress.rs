@@ -627,10 +627,10 @@ pub(crate) fn is_stale_assignment(response: &Response) -> bool {
 }
 
 pub(crate) fn stale_assignment_unavailable() -> Response {
-	::http::Response::builder()
-		.status(StatusCode::SERVICE_UNAVAILABLE)
-		.body(crate::http::Body::empty())
-		.expect("a static status-only response is valid")
+	// The public error envelope of a 503 (with its Retry-After), like every other answer the proxy makes
+	// itself; the stale-assignment header the actor sent is not part of it.
+	crate::proxy::public_error::PublicError::of_status(StatusCode::SERVICE_UNAVAILABLE)
+		.into_direct_response()
 }
 
 impl RequestPolicyTrait for SubstrateIngress {
@@ -909,5 +909,14 @@ mod tests {
 
 		assert_eq!(response.status(), ::http::StatusCode::SERVICE_UNAVAILABLE);
 		assert!(response.headers().get(STALE_ASSIGNMENT_HEADER).is_none());
+		// The answer is the public error envelope, with a Retry-After, and names nothing of the actor.
+		assert_eq!(response.headers()["content-type"], "application/json");
+		assert_eq!(response.headers()["retry-after"], "10");
+		let bytes = crate::http::read_body_with_limit(response.into_body(), 4096)
+			.await
+			.unwrap();
+		let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(body["error"]["code"], "gateway_unavailable");
+		assert!(!body.to_string().contains("actor"), "{body}");
 	}
 }

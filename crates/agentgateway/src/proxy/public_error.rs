@@ -460,11 +460,9 @@ pub fn finish(response: &mut Response, dialect: Dialect) {
 		.unwrap_or(UNKNOWN_REQUEST_ID)
 		.to_owned();
 	*response.body_mut() = Body::from(public.render(dialect, &request_id));
-	// A response policy may have encoded the body this one replaces; the new body is plain JSON.
-	let headers = response.headers_mut();
-	headers.remove(CONTENT_LENGTH);
-	headers.remove(CONTENT_ENCODING);
-	headers.remove(TRANSFER_ENCODING);
+	// A response policy may have set the type, length or encoding of the body this one replaces; the new
+	// body is plain JSON, so the headers are made for it (a Retry-After the answer already has is kept).
+	public.set_headers(response.headers_mut());
 }
 
 /// Whether a content type names JSON (`application/json`, or a `+json` type).

@@ -446,11 +446,17 @@ fn finish_drops_the_encoding_headers_of_the_body_it_replaces() {
 	response
 		.headers_mut()
 		.insert("content-length", HeaderValue::from_static("123"));
+	response.headers_mut().insert(
+		"content-type",
+		HeaderValue::from_static("text/event-stream"),
+	);
 	finish(&mut response, Dialect::Messages);
 	for name in ["content-encoding", "transfer-encoding", "content-length"] {
 		assert!(response.headers().get(name).is_none(), "{name} was kept");
 	}
+	// The type of the replaced body (an event stream here) is not the type of the JSON that replaces it.
 	assert_eq!(header(&response, "content-type"), Some("application/json"));
+	assert_eq!(header(&response, "retry-after"), Some("30"));
 }
 
 fn picker_refusal(status: u16, body: &str, headers: &[(&str, &str)]) -> Response {
