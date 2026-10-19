@@ -587,23 +587,6 @@ impl ProxyError {
 				.unwrap();
 		}
 
-		if let ProxyError::BudgetExceeded(exceeded) = &self {
-			return rb
-				.header(hyper::header::CONTENT_TYPE, "application/json")
-				.header(hyper::header::RETRY_AFTER, exceeded.retry_after.to_string())
-				.body(http::Body::from(
-					serde_json::json!({
-						"error": {
-							"message": exceeded.to_string(),
-							"type": "rate_limit_error",
-							"code": "budget_exceeded",
-						}
-					})
-					.to_string(),
-				))
-				.expect("budget exceeded response is valid");
-		}
-
 		// Add WWW-Authenticate header for MCP failures
 		if let ProxyError::McpJwtAuthenticationFailure(_, www) = &self {
 			if let Ok(hv) = HeaderValue::try_from(www) {

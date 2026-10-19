@@ -4068,8 +4068,16 @@ mod picked_destination_wait_tests {
 		arrival.await.unwrap();
 
 		assert!(matches!(result, Ok(2)), "{result:?}");
-		assert!(started.elapsed() >= Duration::from_millis(300), "{:?}", started.elapsed());
-		assert!(started.elapsed() < Duration::from_millis(300) + SLACK, "{:?}", started.elapsed());
+		assert!(
+			started.elapsed() >= Duration::from_millis(300),
+			"{:?}",
+			started.elapsed()
+		);
+		assert!(
+			started.elapsed() < Duration::from_millis(300) + SLACK,
+			"{:?}",
+			started.elapsed()
+		);
 	}
 
 	#[tokio::test(start_paused = true)]
@@ -4093,8 +4101,16 @@ mod picked_destination_wait_tests {
 
 		// The first run, the run the other insert woke, and the run the destination's insert woke.
 		assert!(matches!(result, Ok(3)), "{result:?}");
-		assert!(started.elapsed() >= Duration::from_millis(500), "{:?}", started.elapsed());
-		assert!(started.elapsed() < Duration::from_millis(500) + SLACK, "{:?}", started.elapsed());
+		assert!(
+			started.elapsed() >= Duration::from_millis(500),
+			"{:?}",
+			started.elapsed()
+		);
+		assert!(
+			started.elapsed() < Duration::from_millis(500) + SLACK,
+			"{:?}",
+			started.elapsed()
+		);
 	}
 
 	#[tokio::test(start_paused = true)]
@@ -4105,7 +4121,10 @@ mod picked_destination_wait_tests {
 
 		let result = until_discovered(rx, LIMIT, || destination.read()).await;
 
-		assert!(matches!(result, Err(ProxyError::NoHealthyEndpoints)), "{result:?}");
+		assert!(
+			matches!(result, Err(ProxyError::NoHealthyEndpoints)),
+			"{result:?}"
+		);
 		// The first run, and the last one the end of the wait makes.
 		assert_eq!(destination.reads(), 2);
 		assert!(started.elapsed() >= LIMIT, "{:?}", started.elapsed());
@@ -4117,7 +4136,12 @@ mod picked_destination_wait_tests {
 		let (inserts, rx) = watch::channel(());
 		let inserts = Arc::new(inserts);
 		let destination = Destination::new(false);
-		let arrival = arrives(&destination, &inserts, LIMIT - Duration::from_millis(1), false);
+		let arrival = arrives(
+			&destination,
+			&inserts,
+			LIMIT - Duration::from_millis(1),
+			false,
+		);
 
 		let result = until_discovered(rx, LIMIT, || destination.read()).await;
 		arrival.await.unwrap();
@@ -4156,7 +4180,10 @@ mod picked_destination_wait_tests {
 
 		let result = until_discovered(rx, LIMIT, || destination.read()).await;
 
-		assert!(matches!(result, Err(ProxyError::NoHealthyEndpoints)), "{result:?}");
+		assert!(
+			matches!(result, Err(ProxyError::NoHealthyEndpoints)),
+			"{result:?}"
+		);
 		assert_eq!(destination.reads(), 2);
 		assert_eq!(started.elapsed(), Duration::ZERO);
 	}
@@ -4173,7 +4200,10 @@ mod picked_destination_wait_tests {
 		})
 		.await;
 
-		assert!(matches!(result, Err(ProxyError::ServiceNotFound)), "{result:?}");
+		assert!(
+			matches!(result, Err(ProxyError::ServiceNotFound)),
+			"{result:?}"
+		);
 		assert_eq!(runs, 1);
 		assert_eq!(started.elapsed(), Duration::ZERO);
 	}

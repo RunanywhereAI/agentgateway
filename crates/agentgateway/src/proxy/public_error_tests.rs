@@ -402,6 +402,57 @@ async fn finish_leaves_the_openai_body_and_an_answer_with_no_marker_alone() {
 	);
 }
 
+#[tokio::test]
+async fn a_budget_refusal_is_a_429_quota_exceeded_that_says_when_to_retry() {
+	let response = ProxyError::BudgetExceeded(crate::http::budget::BudgetExceeded { retry_after: 9 })
+		.into_response_with_grpc(false);
+	assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+	assert_eq!(header(&response, "retry-after"), Some("9"));
+	assert_eq!(header(&response, "content-type"), Some("application/json"));
+	let body = json_of(response).await;
+	let (kind, code) = assert_openai_envelope(&body);
+	assert_eq!(
+		(kind.as_str(), code.as_deref()),
+		("quota", Some("quota_exceeded"))
+	);
+	assert!(
+		!body.to_string().to_lowercase().contains("budget"),
+		"{body}"
+	);
+}
+
+#[tokio::test]
+async fn a_budget_refusal_on_a_messages_path_is_the_messages_envelope() {
+	let mut response =
+		ProxyError::BudgetExceeded(crate::http::budget::BudgetExceeded { retry_after: 9 })
+			.into_response_with_grpc(false);
+	finish(&mut response, Dialect::Messages);
+	assert_eq!(header(&response, "retry-after"), Some("9"));
+	let body = json_of(response).await;
+	assert_eq!(body["type"], "error");
+	assert_eq!(body["error"]["type"], "rate_limit_error");
+	assert_eq!(body["request_id"], UNKNOWN_REQUEST_ID);
+}
+
+#[test]
+fn finish_drops_the_encoding_headers_of_the_body_it_replaces() {
+	let mut response = ProxyError::NoHealthyEndpoints.into_response_with_grpc(false);
+	response
+		.headers_mut()
+		.insert("content-encoding", HeaderValue::from_static("gzip"));
+	response
+		.headers_mut()
+		.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+	response
+		.headers_mut()
+		.insert("content-length", HeaderValue::from_static("123"));
+	finish(&mut response, Dialect::Messages);
+	for name in ["content-encoding", "transfer-encoding", "content-length"] {
+		assert!(response.headers().get(name).is_none(), "{name} was kept");
+	}
+	assert_eq!(header(&response, "content-type"), Some("application/json"));
+}
+
 fn picker_refusal(status: u16, body: &str, headers: &[(&str, &str)]) -> Response {
 	let mut builder = ::http::Response::builder().status(status);
 	for (name, value) in headers {

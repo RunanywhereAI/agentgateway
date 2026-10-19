@@ -89,6 +89,7 @@ enum Kind {
 	Authentication,
 	Permission,
 	RateLimit,
+	Quota,
 	Capacity,
 	Server,
 	Timeout,
@@ -101,6 +102,7 @@ impl Kind {
 			Kind::Authentication => "authentication_error",
 			Kind::Permission => "permission_error",
 			Kind::RateLimit => "rate_limit_error",
+			Kind::Quota => "quota",
 			Kind::Capacity => "capacity",
 			Kind::Server => "server_error",
 			Kind::Timeout => "timeout",
@@ -118,6 +120,7 @@ pub enum Code {
 	Unprocessable,
 	InvalidApiKey,
 	UserRateLimited,
+	QuotaExceeded,
 	CapacityExceeded,
 	UnsupportedEndpoint,
 	GatewayUnavailable,
@@ -131,13 +134,14 @@ pub enum Code {
 
 impl Code {
 	/// Every code, so a test can walk the table.
-	pub const ALL: [Code; 15] = [
+	pub const ALL: [Code; 16] = [
 		Code::BadRequest,
 		Code::NotFound,
 		Code::PayloadTooLarge,
 		Code::Unprocessable,
 		Code::InvalidApiKey,
 		Code::UserRateLimited,
+		Code::QuotaExceeded,
 		Code::CapacityExceeded,
 		Code::UnsupportedEndpoint,
 		Code::GatewayUnavailable,
@@ -158,6 +162,7 @@ impl Code {
 			Code::Unprocessable => "unprocessable",
 			Code::InvalidApiKey => "invalid_api_key",
 			Code::UserRateLimited => "user_rate_limited",
+			Code::QuotaExceeded => "quota_exceeded",
 			Code::CapacityExceeded => "capacity_exceeded",
 			Code::UnsupportedEndpoint => "unsupported_endpoint",
 			Code::GatewayUnavailable => "gateway_unavailable",
@@ -179,6 +184,7 @@ impl Code {
 			| Code::UnsupportedEndpoint => Kind::InvalidRequest,
 			Code::InvalidApiKey => Kind::Authentication,
 			Code::UserRateLimited => Kind::RateLimit,
+			Code::QuotaExceeded => Kind::Quota,
 			Code::CapacityExceeded => Kind::Capacity,
 			Code::GatewayUnavailable
 			| Code::CreditGateUnavailable
@@ -200,6 +206,7 @@ impl Code {
 			Code::Unprocessable => "The request could not be processed.",
 			Code::InvalidApiKey => "The API key is missing, malformed or unknown.",
 			Code::UserRateLimited => "The key has reached its rate limit.",
+			Code::QuotaExceeded => "The key has used its quota.",
 			Code::CapacityExceeded => "No capacity is free for this model right now.",
 			Code::UnsupportedEndpoint => "This model does not support this endpoint.",
 			Code::GatewayUnavailable => "The gateway is unavailable.",
@@ -225,7 +232,7 @@ impl Code {
 			| Code::BadGateway => "api_error",
 			Code::BadRequest | Code::Unprocessable | Code::UnsupportedEndpoint => "invalid_request_error",
 			Code::InvalidApiKey => "authentication_error",
-			Code::UserRateLimited => "rate_limit_error",
+			Code::UserRateLimited | Code::QuotaExceeded => "rate_limit_error",
 		}
 	}
 }
@@ -274,6 +281,16 @@ impl PublicError {
 			StatusCode::SERVICE_UNAVAILABLE,
 			Code::Cold,
 			Some(RETRY_COLD),
+		)
+	}
+
+	/// A budget the proxy enforces is used up (429 `quota_exceeded`); it resets in `retry_after` seconds.
+	pub fn quota(retry_after: u64) -> Self {
+		let retry_after = u32::try_from(retry_after).unwrap_or(u32::MAX).max(1);
+		Self::with(
+			StatusCode::TOO_MANY_REQUESTS,
+			Code::QuotaExceeded,
+			Some(retry_after),
 		)
 	}
 
@@ -339,6 +356,7 @@ impl PublicError {
 			ProxyError::ExternalAuthorizationUnavailable => Self::credit_gate_unavailable(),
 			ProxyError::RequestLimitExceeded => Self::busy(),
 			ProxyError::RateLimitExceeded { reset_seconds, .. } => Self::rate_limited(*reset_seconds),
+			ProxyError::BudgetExceeded(exceeded) => Self::quota(exceeded.retry_after),
 			_ => Self::of_status(status),
 		}
 	}
@@ -442,7 +460,11 @@ pub fn finish(response: &mut Response, dialect: Dialect) {
 		.unwrap_or(UNKNOWN_REQUEST_ID)
 		.to_owned();
 	*response.body_mut() = Body::from(public.render(dialect, &request_id));
-	response.headers_mut().remove(CONTENT_LENGTH);
+	// A response policy may have encoded the body this one replaces; the new body is plain JSON.
+	let headers = response.headers_mut();
+	headers.remove(CONTENT_LENGTH);
+	headers.remove(CONTENT_ENCODING);
+	headers.remove(TRANSFER_ENCODING);
 }
 
 /// Whether a content type names JSON (`application/json`, or a `+json` type).
