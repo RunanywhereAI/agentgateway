@@ -5806,6 +5806,19 @@ mod body_streaming_and_trailers {
 			.expect("the first frame is not an error");
 		assert_eq!(first.into_data().ok().as_deref(), Some(&b"first"[..]));
 		let _hole = BlackHole::open(ext_proc.address.port());
+		let port = ext_proc.address.port();
+		let sampler = tokio::spawn(async move {
+			let t0 = std::time::Instant::now();
+			loop {
+				let out = std::process::Command::new("ss")
+					.args(["-tnoi", "dport", "=", &format!(":{port}")])
+					.output();
+				if let Ok(out) = out {
+					eprintln!("SS at {:?}: {}", t0.elapsed(), String::from_utf8_lossy(&out.stdout).replace('\n', " | "));
+				}
+				tokio::time::sleep(Duration::from_secs(3)).await;
+			}
+		});
 		let feeding = tokio::spawn(async move {
 			let chunk = bytes::Bytes::from(vec![b'x'; 8 * 1024]);
 			while upstream.send(Ok(Frame::data(chunk.clone()))).await.is_ok() {
@@ -5825,6 +5838,7 @@ mod body_streaming_and_trailers {
 		let took = started.elapsed();
 		eprintln!("EVIDENCE blackholed processor: response ended={} after {took:?}", ended.is_ok());
 		feeding.abort();
+		sampler.abort();
 		assert!(ended.is_ok(), "the response was still open after {took:?}");
 		assert!(took < Duration::from_secs(40), "it ended after {took:?}");
 		drop(ext_proc_request);
