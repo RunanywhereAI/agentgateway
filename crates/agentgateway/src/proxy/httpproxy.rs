@@ -3965,7 +3965,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_tcp_policy_without_a_keepalive_keeps_its_connect_timeout_and_gets_the_dead_peer_keepalive() {
+	fn a_tcp_policy_with_no_keepalive_keeps_its_connect_timeout_and_gets_the_default() {
 		use crate::store::BackendPolicies;
 		use crate::types::agent::KeepaliveConfig;
 		use crate::types::backend::TCP;

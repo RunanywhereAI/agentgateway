@@ -29,7 +29,7 @@ fn two_second_keepalive() -> KeepaliveConfig {
 }
 
 #[test]
-fn the_bound_is_what_the_probes_take_and_the_dead_peer_keepalive_is_fourteen_seconds() {
+fn the_bound_is_what_the_probes_take_and_a_processor_call_gets_14_seconds() {
 	assert_eq!(two_second_keepalive().give_up_after(), seconds(2));
 	assert_eq!(KeepaliveConfig::dead_peer().give_up_after(), seconds(14));
 	assert_eq!(KeepaliveConfig::dead_peer().user_timeout, Some(seconds(14)));
