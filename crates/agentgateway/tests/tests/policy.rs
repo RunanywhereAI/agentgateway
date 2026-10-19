@@ -330,13 +330,12 @@ async fn an_unavailable_answer_without_a_body_is_not_cached() {
 	let authz = extauthmock::ExtAuthMock::new(move || UnavailableOnce(answered_once.clone()))
 		.spawn()
 		.await;
+	// A gateway policy, so that an allowed request still has the mock backend to go to.
 	bind
-		.attach_route(json!({
-			"policies": {
-				"extAuthz": {
-					"host": authz.address.to_string(),
-					"cache": {"key": ["request.path"], "ttl": "60s"},
-				},
+		.attach_gateway_policy(json!({
+			"extAuthz": {
+				"host": authz.address.to_string(),
+				"cache": {"key": ["request.path"], "ttl": "60s"},
 			},
 		}))
 		.await;
