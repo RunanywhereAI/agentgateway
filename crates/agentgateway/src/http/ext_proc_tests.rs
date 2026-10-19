@@ -5744,7 +5744,7 @@ mod body_streaming_and_trailers {
 	#[async_trait::async_trait]
 	impl Handler for EchoBodies {}
 
-	/// Drops every packet the proxy sends to `port` on this machine, which is what a peer that
+	/// Drops every packet the proxy sent to `port` on arrival (the INPUT chain of loopback: the proxy's kernel sends them and nothing is acknowledged, as to a peer that vanished), which is what a peer that
 	/// vanished without a FIN looks like from here: the connection stays open, nothing is
 	/// acknowledged, nothing comes back. It needs root and `iptables`.
 	struct BlackHole {
@@ -5759,7 +5759,7 @@ mod body_streaming_and_trailers {
 
 		fn rule(action: &str, port: u16) {
 			let status = std::process::Command::new("iptables")
-				.args([action, "OUTPUT", "-p", "tcp", "--dport", &port.to_string(), "-j", "DROP"])
+				.args([action, "INPUT", "-i", "lo", "-p", "tcp", "--dport", &port.to_string(), "-j", "DROP"])
 				.status()
 				.expect("iptables must be installed");
 			assert!(status.success(), "iptables {action} failed: {status}");
