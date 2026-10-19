@@ -1,8 +1,9 @@
 # RunanywhereAI fork of agentgateway
 
 This branch, `ra/v1.6.0-ra.1`, is upstream tag `v1.6.0`
-(commit ea5608642b9d5c94c5baf5fd9f2f9849b808e963) plus the same four changes and their tests as the `v1.5.0` series
-(`ra/v1.5.0-ra.3`, rebased onto `v1.6.0`, see "The rebase onto v1.6.0" below). Nothing else differs.
+(commit ea5608642b9d5c94c5baf5fd9f2f9849b808e963) plus the same changes and their tests as the `v1.5.0` series
+(`ra/v1.5.0-ra.3`: four changes, and a fifth, the dead-peer bound, that the series gained last; rebased onto `v1.6.0`, see "The
+rebase onto v1.6.0" below). Nothing else differs.
 The `v1.5.0` branches stay as they were: `ra/v1.5.0-ra.3` and its picked-destination-wait follow-ups, `ra/v1.5.0-ra.2`
 (the first two changes, the build `v1.5.0-ra.2`) and `ra/v1.5.0-client-leave` (the first only, the build `v1.5.0-ra.1`).
 The build of this branch reports `v1.6.0-ra.1`.
@@ -103,6 +104,27 @@ passthrough one) waits. Tests: `proxy::httpproxy::picked_destination_wait_tests:
 `http::ext_proc::tests::standalone_inference_routing::standalone_inference_routing_waits_for_the_selected_destination_to_join_the_service`.
 (Commit `fe6e7bad`, by the consumer's picker-readiness work.)
 
+### 5. A processor that falls silent ends its stream in seconds (the dead-peer bound)
+
+A pod that vanishes or a node that is lost sends no FIN and no RST, so the proxy's call to an external processor (the stream
+meter, the endpoint picker) never ended: the kernel sends no keepalive probe while sent data is unacknowledged, and gives up on
+that data only after about 15 minutes. Two parts, both in the series' last commits:
+
+- `KeepaliveConfig` gains `user_timeout` (derived, never read from a config file) and `with_dead_peer_bound()`, which sets it to
+  `time + interval * retries`, the time the probes take to declare an idle peer dead. `transport/stream.rs` applies it as
+  `TCP_USER_TIMEOUT` (Linux only; a user timeout that cannot be set fails the connection, because a connection that silently
+  lacks its bound would hang on a silent peer). A keepalive a backend policy names is given the bound in `dial_config`
+  (`client/mod.rs`), the one place a policy's keepalive is applied, so a policy from a config file and one from the control
+  plane are bounded alike; the proxy's own and the clients' keepalive are not.
+- `PolicyClient::call_ext_proc_with_policies_untraced` (`proxy/httpproxy.rs`), which the ext_proc channel uses, gives a call to a
+  processor with no keepalive policy `KeepaliveConfig::dead_peer()`: the first probe after 5 seconds of silence, then every 3
+  seconds, 3 times, so a silent processor ends the stream in 14 seconds. A keepalive any policy sets on the processor's Service is kept.
+
+Tests: `transport/stream_tests.rs` and `test_helpers` (`wedged_peer`, `wedgeable_relay`: a peer or relay that stops answering
+without closing), the `dial_config` and `with_dead_peer_keepalive` unit tests, and the slow-processor tests in `ext_proc_tests.rs`
+(a live processor silent for longer than the whole 14 seconds is not cut, a wedged one is). The tests that need the user timeout
+are gated to Linux; this code was first compiled on v1.6.0 in Cloud Build.
+
 ## Why
 
 Behind this gateway an inference engine keeps generating for a client that has gone, and the metering
@@ -130,12 +152,13 @@ ext_proc server charges for tokens the client never received.
 
 ## The rebase onto v1.6.0
 
-The series is the fifteen commits of the final `ra/v1.5.0-ra.3` (head `7a6d131e`, on top of `v1.5.0`), in the same order and
+The series is the 29 commits of the final `ra/v1.5.0-ra.3` (head `d83f67a7`, on top of `v1.5.0`), in the same order and
 with the same subjects. The first twelve (up to `ra/v1.5.0-ra.3-picker-wait-deadline-2`) were rebased onto `v1.6.0` by hand: the first
-four commits and the public-error commit were adapted, the rest applied unchanged. The last three (the deadline note in this file;
-the public-error commit that makes the Messages rewrite set the JSON headers and the stale-assignment 503 the envelope; and the
-integration tests that an authorization call which times out or cannot be reached is the 503 credit gate envelope) were added
-afterwards with the re-sync script, a `git cherry-pick -x` each, all without a conflict. No change was dropped: none of them is
+four commits and the public-error commit were adapted, the rest applied unchanged. The rest were added afterwards with the re-sync
+script, a `git cherry-pick -x` each (an empty announcement commit is kept empty). Two of them conflicted, both in
+`types/agent_xds.rs`: v1.6.0 added `impl From<&proto::agent::UrlRewrite> for http::filters::UrlRewrite` where the series adds
+`backend_keepalive` (the first) and where it removes it again (the second). The two are independent, so the resolution keeps
+v1.6.0's conversion in both and the series' function only until the commit that removes it. No change was dropped: none of them is
 redundant on `v1.6.0`. The map from each original commit to its rebased one is kept with the consumer's evidence.
 
 - ext_proc (`crates/agentgateway/src/http/ext_proc.rs`): v1.6.0 replaced `http::DropBody` with the managed `Body`
