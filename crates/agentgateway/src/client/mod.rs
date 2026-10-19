@@ -312,7 +312,7 @@ fn dial_config(
 			config.connect_timeout = connect_timeout;
 		}
 		if let Some(keepalives) = tcp.keepalives.as_ref() {
-			config.keepalives = keepalives.clone().with_dead_peer_bound();
+			config.keepalives = keepalives.clone(); // BREAK RUN C: a policy keepalive is not bounded
 		}
 	}
 	config
