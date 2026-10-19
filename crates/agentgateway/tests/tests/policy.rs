@@ -148,6 +148,129 @@ async fn header_manipulation() {
 	);
 }
 
+/// The public 503 an authorization call that gets no answer is made into: the credit gate envelope with a
+/// Retry-After, nothing of the failure in it.
+async fn assert_credit_gate_unavailable(res: Response) {
+	assert_eq!(res.status(), 503);
+	assert_eq!(res.hdr("content-type"), "application/json");
+	assert_eq!(res.hdr("retry-after"), "10");
+	let body = json_body(res).await;
+	assert_eq!(body["error"]["code"], "credit_gate_unavailable", "{body}");
+	assert_eq!(body["error"]["type"], "server_error", "{body}");
+	assert!(body["error"]["param"].is_null(), "{body}");
+	let text = body.to_string();
+	for internal in [
+		"timed out",
+		"deadline",
+		"refused",
+		"127.0.0.1",
+		"ext_authz",
+		"authorization",
+	] {
+		assert!(!text.contains(internal), "{text}");
+	}
+}
+
+#[tokio::test]
+async fn an_authorization_call_that_times_out_is_a_503_credit_gate_unavailable() {
+	struct Slow;
+
+	#[async_trait::async_trait]
+	impl extauthmock::Handler for Slow {
+		async fn check(
+			&mut self,
+			_request: &agentgateway::http::ext_authz::proto::CheckRequest,
+		) -> Result<agentgateway::http::ext_authz::proto::CheckResponse, tonic::Status> {
+			tokio::time::sleep(Duration::from_secs(10)).await;
+			extauthmock::allow_response(None)
+		}
+	}
+
+	let (_mock, mut bind, io) = basic_setup().await;
+	let authz = extauthmock::ExtAuthMock::new(|| Slow).spawn().await;
+	bind
+		.attach_route(json!({
+			"policies": {
+				"extAuthz": {
+					"host": authz.address.to_string(),
+					"policies": {"http": {"requestTimeout": "300ms"}},
+				},
+			},
+		}))
+		.await;
+
+	let began = std::time::Instant::now();
+	let res = send_request(io, Method::POST, "http://lo/v1/chat/completions").await;
+	assert!(
+		began.elapsed() < Duration::from_secs(5),
+		"the call was not cut at its timeout"
+	);
+	assert_credit_gate_unavailable(res).await;
+}
+
+#[tokio::test]
+async fn an_authorization_service_that_cannot_be_reached_is_a_503_credit_gate_unavailable() {
+	let (_mock, mut bind, io) = basic_setup().await;
+	bind
+		.attach_route(json!({
+			"policies": {
+				"extAuthz": {
+					// Nothing listens here: the connection is refused, as with no admission backend at all.
+					"host": "127.0.0.1:1",
+				},
+			},
+		}))
+		.await;
+
+	assert_credit_gate_unavailable(
+		send_request(io, Method::POST, "http://lo/v1/chat/completions").await,
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn an_authorization_service_that_refuses_without_a_body_is_a_403_in_the_envelope() {
+	// The residual case: the service answers with a denial and no HTTP response. The proxy cannot tell this
+	// from a refusal it should pass on, so it stays a 403, with the public sentence and no code.
+	struct DeniesWithoutBody;
+
+	#[async_trait::async_trait]
+	impl extauthmock::Handler for DeniesWithoutBody {
+		async fn check(
+			&mut self,
+			_request: &agentgateway::http::ext_authz::proto::CheckRequest,
+		) -> Result<agentgateway::http::ext_authz::proto::CheckResponse, tonic::Status> {
+			Ok(agentgateway::http::ext_authz::proto::CheckResponse {
+				status: Some(agentgateway::http::ext_authz::proto::Status {
+					code: 14,
+					message: "unavailable".to_string(),
+					details: vec![],
+				}),
+				http_response: None,
+				dynamic_metadata: None,
+			})
+		}
+	}
+
+	let (_mock, mut bind, io) = basic_setup().await;
+	let authz = extauthmock::ExtAuthMock::new(|| DeniesWithoutBody)
+		.spawn()
+		.await;
+	bind
+		.attach_route(json!({
+			"policies": {"extAuthz": {"host": authz.address.to_string()}},
+		}))
+		.await;
+
+	let res = send_request(io, Method::POST, "http://lo/v1/chat/completions").await;
+	assert_eq!(res.status(), 403);
+	assert_eq!(res.hdr("content-type"), "application/json");
+	let body = json_body(res).await;
+	assert_eq!(body["error"]["type"], "permission_error", "{body}");
+	assert!(body["error"]["code"].is_null(), "{body}");
+	assert!(!body.to_string().contains("unavailable"), "{body}");
+}
+
 #[tokio::test]
 async fn gateway_ext_authz_response_headers_are_preserved() {
 	struct AddResponseHeader;
