@@ -69,8 +69,10 @@ internal may reach it. The new module `proxy/public_error.rs` is the one place t
 - A new error `ExternalAuthorizationUnavailable`: the external authorization call got no answer and the policy fails
   closed. It was a 403 ("external authorization failed"), which tells the caller it is not entitled. It is now the 503
   `credit_gate_unavailable` with `Retry-After: 10`, the answer admission itself gives when its own authorize fails.
-  Its metrics reason stays `ExtAuth`. A refusal the service sent without a response is still `ExternalAuthorizationFailed`
-  (403, no code).
+  Its metrics reason stays `ExtAuth`. A response with status UNAVAILABLE and no custom response at all (admission's
+  `unavailable()`, a failure it cannot classify) is the same 503, decided before the cache is written so a transient fault is
+  never a cached refusal; a denial that carries a response, including admission's own 503 envelopes (also status UNAVAILABLE),
+  is passed on untouched, and every other code without a response is still `ExternalAuthorizationFailed` (403, no code).
 - `to_immediate_response` (an external processor answering the request itself) wraps an error answer that is not JSON
   (no JSON content type and a body that is not one JSON object) in the envelope: a 429 is `capacity_exceeded`
   (`Retry-After: 12`), a 503 is `cold` (`Retry-After: 30`; `draining` when the picker says it is shutting down), any other
