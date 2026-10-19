@@ -6152,6 +6152,44 @@ mod body_streaming_and_trailers {
 		drop(ext_proc_request);
 	}
 
+	// The production numbers: a processor that stays silent for longer than the whole default bound
+	// (14 s) and acknowledges everything is a healthy connection (a queued picker, a long prefill) and
+	// the call to it is not cut. No policy names a keepalive, so the call has the built-in one.
+	#[tokio::test]
+	async fn a_processor_silent_for_longer_than_the_default_bound_but_alive_is_not_cut() {
+		let silence = Duration::from_secs(16);
+		assert!(silence > KeepaliveConfig::dead_peer().give_up_after());
+		let ext_proc = ExtProcMock::new(move || AnswersBodiesAfter(silence))
+			.spawn()
+			.await;
+		let mut ext_proc_request = build_ext_proc_request_for_test(
+			ext_proc.address,
+			ext_proc::ProcessingOptions {
+				response_body_mode: ext_proc::BodySendMode::FullDuplexStreamed,
+				..Default::default()
+			},
+		);
+		let frames = tokio_stream::iter(vec![Ok::<Frame<bytes::Bytes>, Infallible>(Frame::data(
+			bytes::Bytes::from_static(b"upstream-response"),
+		))]);
+		let mut resp = http::Response::new(Body::new(http_body_util::StreamBody::new(frames)));
+		let _ = ext_proc_request
+			.mutate_response(&mut resp, None)
+			.await
+			.unwrap();
+		let started = std::time::Instant::now();
+		let body = tokio::time::timeout(Duration::from_secs(60), read_body_raw(resp.into_body()))
+			.await
+			.expect("the slow processor's answer must arrive");
+		assert_eq!(body.as_ref(), b"upstream-response");
+		assert!(
+			started.elapsed() >= silence,
+			"the processor answered after {:?}, so the test did not hold the connection silent",
+			started.elapsed()
+		);
+		drop(ext_proc_request);
+	}
+
 	/// The mock's own defaults: every body chunk comes straight back as the processed chunk.
 	struct EchoBodies;
 
