@@ -3,6 +3,14 @@ use agentgateway::test_helpers::extprocmock::{ExtProcMock, ReplaceRequestBody};
 
 use crate::common::prelude::*;
 
+/// The body of a response as JSON. `read_body!` reads at most 100 bytes, which an error object passes.
+async fn json_body(res: Response) -> serde_json::Value {
+	let bytes = agentgateway::http::read_body_with_limit(res.into_body(), 4096)
+		.await
+		.unwrap();
+	serde_json::from_slice(&bytes).unwrap()
+}
+
 #[tokio::test]
 async fn request_redirect_without_backend() {
 	let mut bind = setup_proxy_test("{}").unwrap().with_bind(simple_bind());
@@ -59,7 +67,7 @@ async fn response_policy_short_circuit() {
 	assert_eq!(res.hdr("x-xfm"), "");
 	assert_eq!(res.hdr("content-type"), "application/json");
 	assert_eq!(res.hdr("retry-after"), "10");
-	let body: serde_json::Value = serde_json::from_slice(read_body!(res).as_ref()).unwrap();
+	let body = json_body(res).await;
 	assert_eq!(body["error"]["code"], "credit_gate_unavailable");
 	assert_eq!(body["error"]["type"], "server_error");
 	assert!(!body.to_string().contains("127.0.0.1"));
@@ -83,13 +91,13 @@ async fn an_error_the_proxy_makes_on_a_messages_path_is_the_messages_envelope() 
 	assert_eq!(res.status(), 503);
 	assert_eq!(res.hdr("content-type"), "application/json");
 	assert_eq!(res.hdr("retry-after"), "10");
-	let body: serde_json::Value = serde_json::from_slice(read_body!(res).as_ref()).unwrap();
+	let body = json_body(res).await;
 	assert_eq!(body["type"], "error");
 	assert_eq!(body["error"]["type"], "api_error");
 	assert_eq!(body["request_id"], "unknown");
 
 	let res = send_request(io, Method::POST, "http://lo/v1/chat/completions").await;
-	let body: serde_json::Value = serde_json::from_slice(read_body!(res).as_ref()).unwrap();
+	let body = json_body(res).await;
 	assert!(body.get("type").is_none());
 	assert_eq!(body["error"]["code"], "credit_gate_unavailable");
 }
