@@ -90,6 +90,9 @@ impl Default for BodyOptions {
 	}
 }
 
+/// The gRPC status code UNAVAILABLE (google.rpc.Code 14) in a `CheckResponse`'s status.
+const GRPC_UNAVAILABLE: i32 = tonic::Code::Unavailable as i32;
+
 #[apply(schema!)]
 #[cfg_attr(feature = "schema", schemars(rename = "ExtAuthzFailureMode"))]
 #[derive(Default)]
@@ -631,6 +634,14 @@ impl ExtAuthz {
 				let response = cached.clone().apply(req)?;
 				self.insert_cache(cache_key, req, CachedPolicyResponse::Grpc(cached));
 				return Ok(response);
+			}
+			// A bare UNAVAILABLE (no custom response at all) is the authorization service saying that it cannot
+			// decide, not a decision about the caller: the same answer as a call that gets no answer, a retryable
+			// 503, and never cached (a transient fault must not become a cached refusal). A denial that carries a
+			// response, including the service's own 503 envelope with status UNAVAILABLE, took the branch above
+			// and is passed on untouched; any other code without a response stays a refusal.
+			if status == GRPC_UNAVAILABLE && cr.http_response.is_none() {
+				return Err(ProxyError::ExternalAuthorizationUnavailable);
 			}
 			let cached = CachedGrpcPolicyResponse::DenyWithoutResponse { dynamic_metadata };
 			let response = cached.clone().apply(req);
